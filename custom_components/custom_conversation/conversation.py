@@ -2,6 +2,7 @@
 
 import ast
 from collections.abc import AsyncGenerator, Callable
+from datetime import datetime, timezone
 import json
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
@@ -227,80 +228,156 @@ async def _transform_litellm_stream(
 ) -> AsyncGenerator[AssistantContentDeltaDict, None]:
     """Transform a LiteLLM delta stream into HA format."""
     current_tool_call: dict | None = None
+    content_parts: list[str] = []
+    completed_tool_calls: list[dict] = []
+    usage: Any = None
+    model: str | None = None
+    completion_start_time: datetime | None = None
 
-    async for chunk in result:
-        LOGGER.debug("Received chunk: %s", chunk)
-        if not chunk.choices:
-            if chunk.usage:
-                LOGGER.debug("Received usage chunk: %s", chunk.usage)
-            continue
+    try:
+        async for chunk in result:
+            LOGGER.debug("Received chunk: %s", chunk)
+            if model is None and getattr(chunk, "model", None):
+                model = chunk.model
+            if not chunk.choices:
+                if chunk.usage:
+                    usage = chunk.usage
+                    LOGGER.debug("Received usage chunk: %s", chunk.usage)
+                continue
 
-        choice = chunk.choices[0]
+            choice = chunk.choices[0]
 
-        if choice.finish_reason:
+            if choice.finish_reason:
+                if current_tool_call:
+                    # Gemini's OpenAI interface doesn't generate ids for tool calls, so we'll create one from the index
+                    if not current_tool_call.get("id"):
+                        current_tool_call["id"] = f"call_{current_tool_call['index']}"
+                    completed_tool_calls.append(
+                        {
+                            "id": current_tool_call["id"],
+                            "name": current_tool_call.get("name"),
+                            "arguments": current_tool_call.get("tool_args", ""),
+                        }
+                    )
+                    yield {
+                        "tool_calls": [
+                            llm.ToolInput(
+                                id=current_tool_call.get("id"),
+                                tool_name=current_tool_call.get("name"),
+                                tool_args=_parse_tool_args(
+                                    current_tool_call.get("tool_args", "{}")
+                                ),
+                            )
+                        ]
+                    }
+                current_tool_call = None
+                continue
+
+            delta = choice.delta
+
+            if completion_start_time is None and (
+                delta.content or delta.tool_calls
+            ):
+                completion_start_time = datetime.now(timezone.utc)
+
+            if delta.content:
+                content_parts.append(delta.content)
+
+            # Yield messages that don't involve tool calls
+            if current_tool_call is None and not delta.tool_calls:
+                yield {
+                    key: value
+                    for key in ("role", "content")
+                    if (value := getattr(delta, key)) is not None
+                }
+                continue
+
+            # When doing tool calls, we should always have a tool call
+            # object or we have gotten stopped above with a finish_reason set
+            if (
+                not delta.tool_calls
+                or not (delta_tool_call := delta.tool_calls[0])
+                or not delta_tool_call.function
+            ):
+                raise ValueError("Expected delta with tool call")
+
+            if current_tool_call and delta_tool_call.index == current_tool_call["index"]:
+                current_tool_call["tool_args"] += delta_tool_call.function.arguments or ""
+                continue
+
+            # We got a tool call with new index, so we need to yield the previous
             if current_tool_call:
-                # Gemini's OpenAI interface doesn't generate ids for tool calls, so we'll create one from the index
-                if not current_tool_call.get("id"):
-                    current_tool_call["id"] = f"call_{current_tool_call['index']}"
+                completed_tool_calls.append(
+                    {
+                        "id": current_tool_call["id"],
+                        "name": current_tool_call["name"],
+                        "arguments": current_tool_call["tool_args"],
+                    }
+                )
                 yield {
                     "tool_calls": [
                         llm.ToolInput(
-                            id=current_tool_call.get("id"),
-                            tool_name=current_tool_call.get("name"),
-                            tool_args=_parse_tool_args(
-                                current_tool_call.get("tool_args", "{}")
-                            ),
+                            id=current_tool_call["id"],
+                            tool_name=current_tool_call["name"],
+                            tool_args=json.loads(current_tool_call["tool_args"]),
                         )
                     ]
                 }
-            current_tool_call = None
-            continue
 
-        delta = choice.delta
-
-        # Yield messages that don't involve tool calls
-        if current_tool_call is None and not delta.tool_calls:
-            yield {
-                key: value
-                for key in ("role", "content")
-                if (value := getattr(delta, key)) is not None
+            # Gemini's OpenAI interface doesn't generate ids for tool calls, so we'll create one from the index
+            if not delta_tool_call.id:
+                delta_tool_call.id = f"call_{delta_tool_call.index}"
+            current_tool_call = {
+                "index": delta_tool_call.index,
+                "id": delta_tool_call.id,
+                "name": delta_tool_call.function.name,
+                "tool_args": delta_tool_call.function.arguments or "",
             }
-            continue
+    finally:
+        _report_generation_to_langfuse(
+            content="".join(content_parts),
+            tool_calls=completed_tool_calls,
+            usage=usage,
+            model=model,
+            completion_start_time=completion_start_time,
+        )
 
-        # When doing tool calls, we should always have a tool call
-        # object or we have gotten stopped above with a finish_reason set
-        if (
-            not delta.tool_calls
-            or not (delta_tool_call := delta.tool_calls[0])
-            or not delta_tool_call.function
+
+def _report_generation_to_langfuse(
+    *,
+    content: str,
+    tool_calls: list[dict],
+    usage: Any,
+    model: str | None,
+    completion_start_time: datetime | None,
+) -> None:
+    """Attach LLM output + usage to the current Langfuse generation span."""
+    output: dict[str, Any] = {"content": content}
+    if tool_calls:
+        output["tool_calls"] = tool_calls
+
+    update_kwargs: dict[str, Any] = {"output": output}
+    if model:
+        update_kwargs["model"] = model
+    if completion_start_time is not None:
+        update_kwargs["completion_start_time"] = completion_start_time
+    if usage is not None:
+        usage_details: dict[str, int] = {}
+        for src_key, dst_key in (
+            ("prompt_tokens", "input"),
+            ("completion_tokens", "output"),
+            ("total_tokens", "total"),
         ):
-            raise ValueError("Expected delta with tool call")
+            value = getattr(usage, src_key, None)
+            if isinstance(value, int):
+                usage_details[dst_key] = value
+        if usage_details:
+            update_kwargs["usage_details"] = usage_details
 
-        if current_tool_call and delta_tool_call.index == current_tool_call["index"]:
-            current_tool_call["tool_args"] += delta_tool_call.function.arguments or ""
-            continue
-
-        # We got a tool call with new index, so we need to yield the previous
-        if current_tool_call:
-            yield {
-                "tool_calls": [
-                    llm.ToolInput(
-                        id=current_tool_call["id"],
-                        tool_name=current_tool_call["name"],
-                        tool_args=json.loads(current_tool_call["tool_args"]),
-                    )
-                ]
-            }
-
-        # Gemini's OpenAI interface doesn't generate ids for tool calls, so we'll create one from the index
-        if not delta_tool_call.id:
-            delta_tool_call.id = f"call_{delta_tool_call.index}"
-        current_tool_call = {
-            "index": delta_tool_call.index,
-            "id": delta_tool_call.id,
-            "name": delta_tool_call.function.name,
-            "tool_args": delta_tool_call.function.arguments or "",
-        }
+    try:
+        get_langfuse_client().update_current_generation(**update_kwargs)
+    except Exception:  # noqa: BLE001 — telemetry must not fail the conversation
+        LOGGER.debug("Failed to update langfuse generation span", exc_info=True)
 
 
 async def _remove_failed_hass_agent_messages(
