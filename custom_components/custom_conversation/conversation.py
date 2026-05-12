@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timezone
 import json
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
+import warnings
 
 from langfuse import get_client as get_langfuse_client, observe, propagate_attributes
 
@@ -71,6 +72,14 @@ from .const import (
     LOGGER,
 )
 from .prompt_manager import PromptManager
+
+# Pinned litellm's success_handler model_dumps a streaming ModelResponse whose
+# Choices|StreamingChoices union doesn't discriminate; benign serializer noise.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Pydantic serializer warnings:",
+    category=UserWarning,
+)
 
 # Max number of back and forth with the LLM to generate a response
 MAX_TOOL_ITERATIONS = 10
