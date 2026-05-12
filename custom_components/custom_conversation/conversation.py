@@ -1,6 +1,7 @@
 """Conversation support for Custom Conversation APIs."""
 
 import ast
+import asyncio
 from collections.abc import AsyncGenerator, Callable
 from datetime import datetime, timezone
 import json
@@ -432,6 +433,8 @@ class CustomConversationEntity(
                 conversation.ConversationEntityFeature.CONTROL
             )
         self.prompt_manager = prompt_manager
+        self._router: Router | None = None
+        self._router_lock = asyncio.Lock()
         if entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
             CONF_LANGFUSE_TRACING_ENABLED, False
         ):
@@ -754,6 +757,53 @@ class CustomConversationEntity(
             continue_conversation=chat_log.continue_conversation,
         ), llm_details
 
+    async def _async_get_router(
+        self, entry: CustomConversationConfigEntry
+    ) -> Router:
+        """Return the cached Router, building it off the event loop on first use.
+
+        litellm.Router does synchronous import_module calls during construction
+        which block HA's event loop. Build once per entity in an executor.
+        """
+        if self._router is not None:
+            return self._router
+        async with self._router_lock:
+            if self._router is not None:
+                return self._router
+            self._router = await self.hass.async_add_executor_job(
+                self._build_router, entry
+            )
+            return self._router
+
+    @staticmethod
+    def _build_router(entry: CustomConversationConfigEntry) -> Router:
+        primary_model = f"{entry.data.get(CONF_PRIMARY_PROVIDER)}/{entry.data.get(CONF_PRIMARY_CHAT_MODEL)}"
+        model_list: list[dict[str, Any]] = [
+            {
+                "model_name": primary_model,
+                "litellm_params": {
+                    "model": primary_model,
+                    "api_base": entry.data.get(CONF_PRIMARY_BASE_URL),
+                    "api_key": entry.data.get(CONF_PRIMARY_API_KEY),
+                },
+            },
+        ]
+        fallbacks: list[dict[str, list[str]]] = []
+        if entry.data.get(CONF_SECONDARY_PROVIDER_ENABLED):
+            secondary_model = f"{entry.data.get(CONF_SECONDARY_PROVIDER)}/{entry.data.get(CONF_SECONDARY_CHAT_MODEL)}"
+            model_list.append(
+                {
+                    "model_name": secondary_model,
+                    "litellm_params": {
+                        "model": secondary_model,
+                        "api_base": entry.data.get(CONF_SECONDARY_BASE_URL),
+                        "api_key": entry.data.get(CONF_SECONDARY_API_KEY),
+                    },
+                }
+            )
+            fallbacks = [{primary_model: [secondary_model]}]
+        return Router(model_list=model_list, fallbacks=fallbacks)
+
     @observe(
         name="cc_generate_completion",
         as_type="generation",
@@ -784,36 +834,7 @@ class CustomConversationEntity(
             input=cleaned_input,
         )
         primary_model = f"{entry.data.get(CONF_PRIMARY_PROVIDER)}/{entry.data.get(CONF_PRIMARY_CHAT_MODEL)}"
-        secondary_model = (
-            f"{entry.data.get(CONF_SECONDARY_PROVIDER)}/{entry.data.get(CONF_SECONDARY_CHAT_MODEL)}"
-            if entry.data.get(CONF_SECONDARY_PROVIDER_ENABLED)
-            else ""
-        )
-        fallbacks = []
-        model_list = [
-            {
-                "model_name": primary_model,
-                "litellm_params": {
-                    "model": primary_model,
-                    "api_base": entry.data.get(CONF_PRIMARY_BASE_URL),
-                    "api_key": entry.data.get(CONF_PRIMARY_API_KEY),
-                },
-            },
-        ]
-        if entry.data.get(CONF_SECONDARY_PROVIDER_ENABLED):
-            model_list.append(
-                {
-                    "model_name": secondary_model,
-                    "litellm_params": {
-                        "model": secondary_model,
-                        "api_base": entry.data.get(CONF_SECONDARY_BASE_URL),
-                        "api_key": entry.data.get(CONF_SECONDARY_API_KEY),
-                    },
-                }
-            )
-            fallbacks = [{primary_model: [secondary_model]}]
-
-        router = Router(model_list=model_list, fallbacks=fallbacks)
+        router = await self._async_get_router(entry)
 
         temperature = entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
         top_p = entry.options.get(CONF_TOP_P, DEFAULT_TOP_P)
