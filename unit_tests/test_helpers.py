@@ -1,6 +1,12 @@
 """Test helpers that don't import the component."""
+from contextlib import contextmanager
 import sys
 from unittest.mock import AsyncMock, MagicMock, Mock
+
+
+@contextmanager
+def _noop_propagate_attributes(*args, **kwargs):
+    yield
 
 
 def setup_mocks():
@@ -29,6 +35,8 @@ def setup_mocks():
     mock_langfuse.api = Mock()
     # Mock the observe decorator to simply return the function
     mock_langfuse.observe = lambda *args, **kwargs: lambda f: f
+    # propagate_attributes is used as a context manager; a no-op suffices for tests
+    mock_langfuse.propagate_attributes = _noop_propagate_attributes
     # Mock get_client to return a mock langfuse client
     mock_langfuse.get_client = MagicMock(return_value=mock_langfuse_client)
     # Mock the Langfuse constructor (used for configuration)
