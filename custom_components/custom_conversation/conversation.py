@@ -697,8 +697,6 @@ class CustomConversationEntity(
         get_langfuse_client().update_current_span(
             input=cleaned_input,
         )
-        generation_id = get_langfuse_client().get_current_observation_id()
-        existing_trace_id = get_langfuse_client().get_current_trace_id()
         primary_model = f"{entry.data.get(CONF_PRIMARY_PROVIDER)}/{entry.data.get(CONF_PRIMARY_CHAT_MODEL)}"
         secondary_model = (
             f"{entry.data.get(CONF_SECONDARY_PROVIDER)}/{entry.data.get(CONF_SECONDARY_CHAT_MODEL)}"
@@ -735,8 +733,6 @@ class CustomConversationEntity(
         top_p = entry.options.get(CONF_TOP_P, DEFAULT_TOP_P)
         max_tokens = entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
 
-        langfuse_params = entry.options.get(CONF_LANGFUSE_SECTION, {})
-
         completion_kwargs = {
             "model": primary_model,
             "messages": messages,
@@ -746,19 +742,7 @@ class CustomConversationEntity(
             "temperature": temperature,
             "user": conversation_id,
             "stream": True,
-            "metadata": {
-                "generation_id": generation_id,
-                "existing_trace_id": existing_trace_id,
-                "generation_name": "cc_generate_completion",
-                "prompt": prompt.__dict__ if prompt else None,
-            },
-            "langfuse_secret_key": langfuse_params.get(CONF_LANGFUSE_SECRET_KEY),
-            "langfuse_public_key": langfuse_params.get(CONF_LANGFUSE_PUBLIC_KEY),
-            "langfuse_host": langfuse_params.get(CONF_LANGFUSE_HOST),
             "stream_options": {"include_usage": True},
-            "callbacks": ["langfuse"]
-            if langfuse_params.get(CONF_LANGFUSE_TRACING_ENABLED)
-            else None,
         }
 
         try:
