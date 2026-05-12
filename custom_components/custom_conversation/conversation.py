@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator, Callable
 import json
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
-from langfuse import get_client as get_langfuse_client, observe
+from langfuse import get_client as get_langfuse_client, observe, propagate_attributes
 
 if TYPE_CHECKING:
     from langfuse.model import PromptClient
@@ -197,7 +197,7 @@ def _convert_content_to_param(
         if role == "system":
             role = "developer"
         return cast(
-            ChatCompletionMessageParam,
+            "ChatCompletionMessageParam",
             {
                 "role": content.role,
                 "content": content.content,
@@ -417,114 +417,116 @@ class CustomConversationEntity(
         )
         new_tags = user_configured_tags + device_tags
 
-        get_langfuse_client().update_current_span(metadata={"tags": new_tags})
-        event_data = {
-            "agent_id": user_input.agent_id,
-            "conversation_id": user_input.conversation_id,
-            "language": user_input.language,
-            "device_id": user_input.device_id,
-            "device_name": device_data["device_name"],
-            "device_area": device_data["device_area"],
-            "text": user_input.text,
-            "user_id": user_input.context.user_id,
-        }
+        with propagate_attributes(tags=new_tags):
+            event_data = {
+                "agent_id": user_input.agent_id,
+                "conversation_id": user_input.conversation_id,
+                "language": user_input.language,
+                "device_id": user_input.device_id,
+                "device_name": device_data["device_name"],
+                "device_area": device_data["device_area"],
+                "text": user_input.text,
+                "user_id": user_input.context.user_id,
+            }
 
-        self.hass.bus.async_fire(CONVERSATION_STARTED_EVENT, event_data)
-        intent_response = intent.IntentResponse(language=user_input.language)
-        intent_response.async_set_error(
-            intent.IntentResponseErrorCode.UNKNOWN,
-            "Sorry, there are no enabled Agents",
-        )
-        result = conversation.ConversationResult(
-            response=intent_response, conversation_id=user_input.conversation_id
-        )
+            self.hass.bus.async_fire(CONVERSATION_STARTED_EVENT, event_data)
+            intent_response = intent.IntentResponse(language=user_input.language)
+            intent_response.async_set_error(
+                intent.IntentResponseErrorCode.UNKNOWN,
+                "Sorry, there are no enabled Agents",
+            )
+            result = conversation.ConversationResult(
+                response=intent_response, conversation_id=user_input.conversation_id
+            )
 
-        if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_HASS_AGENT):
-            LOGGER.debug("Processing with Home Assistant agent")
-            with (
-                chat_session.async_get_chat_session(
-                    self.hass, user_input.conversation_id
-                ) as session,
-                async_get_chat_log(self.hass, session, user_input) as chat_log,
-            ):
-                result = await self._async_handle_message_with_hass(user_input)
-                LOGGER.debug("Received response: %s", result.response.speech)
-                if result.response.error_code is None:
-                    await self._async_fire_conversation_ended(
-                        result,
-                        HOME_ASSISTANT_AGENT,
-                        user_input,
-                        device_data=device_data,
-                    )
-                    new_tags = ["handling_agent:home_assistant"]
-                    if result.response.intent.intent_type is not None:
-                        new_tags.append(f"intent:{result.response.intent.intent_type}")
-                    if len(result.response.success_results) > 0:
-                        for success_result in result.response.success_results:
-                            new_tags.append(f"affected_entity:{success_result.id}")
-                    get_langfuse_client().update_current_span(output=result.as_dict())
-                    get_langfuse_client().update_current_span(metadata={"tags": new_tags})
-                    return conversation.ConversationResult(
-                        response=result.response,
-                        conversation_id=session.conversation_id,
-                    )
-                # If we're about to call the LLM Agent next, we want to delete the last two messages
-                if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_LLM_AGENT):
-                    chat_log.content = await _remove_failed_hass_agent_messages(
-                        chat_log.content
-                    )
-
-        if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_LLM_AGENT):
-            LOGGER.debug("Processing with LLM agent")
-            try:
+            if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_HASS_AGENT):
+                LOGGER.debug("Processing with Home Assistant agent")
                 with (
                     chat_session.async_get_chat_session(
                         self.hass, user_input.conversation_id
                     ) as session,
                     async_get_chat_log(self.hass, session, user_input) as chat_log,
                 ):
-                    LOGGER.debug("Trying to handle the message with LLM")
-                    result, llm_data = await self._async_handle_message_with_llm(
-                        user_input, chat_log
-                    )
+                    result = await self._async_handle_message_with_hass(user_input)
                     LOGGER.debug("Received response: %s", result.response.speech)
                     if result.response.error_code is None:
                         await self._async_fire_conversation_ended(
                             result,
-                            "LLM",
-                            user_input,
-                            llm_data=llm_data,
-                            device_data=device_data,
-                        )
-                        get_langfuse_client().update_current_span(
-                            metadata={"tags": ["handling_agent:llm"]}
-                        )
-                    else:
-                        await self._async_fire_conversation_error(
-                            result.response.error_code,
-                            "LLM",
+                            HOME_ASSISTANT_AGENT,
                             user_input,
                             device_data=device_data,
                         )
-            except RateLimitError as err:
-                error_message = getattr(err, "body", str(err))
-                await self._async_fire_conversation_error(
-                    error_message,
-                    "LLM",
-                    user_input,
-                    device_data=device_data,
-                )
-                raise HomeAssistantError("Rate limited or insufficient funds") from err
-            except OpenAIError as err:
-                error_message = getattr(err, "body", str(err))
-                await self._async_fire_conversation_error(
-                    error_message,
-                    "LLM",
-                    user_input,
-                    device_data=device_data,
-                )
-                raise HomeAssistantError("Error talking to OpenAI API") from err
-        return result
+                        hass_tags = ["handling_agent:home_assistant"]
+                        if result.response.intent.intent_type is not None:
+                            hass_tags.append(f"intent:{result.response.intent.intent_type}")
+                        if len(result.response.success_results) > 0:
+                            hass_tags.extend(
+                                f"affected_entity:{success_result.id}"
+                                for success_result in result.response.success_results
+                            )
+                        get_langfuse_client().update_current_span(output=result.as_dict())
+                        with propagate_attributes(tags=hass_tags):
+                            pass
+                        return conversation.ConversationResult(
+                            response=result.response,
+                            conversation_id=session.conversation_id,
+                        )
+                    # If we're about to call the LLM Agent next, we want to delete the last two messages
+                    if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_LLM_AGENT):
+                        chat_log.content = await _remove_failed_hass_agent_messages(
+                            chat_log.content
+                        )
+
+            if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_LLM_AGENT):
+                LOGGER.debug("Processing with LLM agent")
+                try:
+                    with (
+                        chat_session.async_get_chat_session(
+                            self.hass, user_input.conversation_id
+                        ) as session,
+                        async_get_chat_log(self.hass, session, user_input) as chat_log,
+                    ):
+                        LOGGER.debug("Trying to handle the message with LLM")
+                        result, llm_data = await self._async_handle_message_with_llm(
+                            user_input, chat_log
+                        )
+                        LOGGER.debug("Received response: %s", result.response.speech)
+                        if result.response.error_code is None:
+                            await self._async_fire_conversation_ended(
+                                result,
+                                "LLM",
+                                user_input,
+                                llm_data=llm_data,
+                                device_data=device_data,
+                            )
+                            with propagate_attributes(tags=["handling_agent:llm"]):
+                                pass
+                        else:
+                            await self._async_fire_conversation_error(
+                                result.response.error_code,
+                                "LLM",
+                                user_input,
+                                device_data=device_data,
+                            )
+                except RateLimitError as err:
+                    error_message = getattr(err, "body", str(err))
+                    await self._async_fire_conversation_error(
+                        error_message,
+                        "LLM",
+                        user_input,
+                        device_data=device_data,
+                    )
+                    raise HomeAssistantError("Rate limited or insufficient funds") from err
+                except OpenAIError as err:
+                    error_message = getattr(err, "body", str(err))
+                    await self._async_fire_conversation_error(
+                        error_message,
+                        "LLM",
+                        user_input,
+                        device_data=device_data,
+                    )
+                    raise HomeAssistantError("Error talking to OpenAI API") from err
+            return result
 
     @observe(name="cc_handle_message_with_hass")
     async def _async_handle_message_with_hass(
@@ -657,7 +659,8 @@ class CustomConversationEntity(
         intent_response.async_set_speech(final_assistant_message.content or "")
 
         llm_details, new_tags = _get_llm_details(messages)
-        get_langfuse_client().update_current_span(metadata={"tags": new_tags})
+        with propagate_attributes(tags=new_tags):
+            pass
 
         return conversation.ConversationResult(
             response=intent_response,
