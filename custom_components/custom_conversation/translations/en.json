@@ -143,6 +143,9 @@
           }
         }
       }
+    },
+    "error": {
+      "langfuse_score_requires_tracing": "Langfuse scoring requires Langfuse tracing to be enabled."
     }
   },
   "services": {

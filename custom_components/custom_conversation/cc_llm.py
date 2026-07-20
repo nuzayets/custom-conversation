@@ -1,5 +1,4 @@
 """Replaces Some of Home Assistant's helpers/llm.py code to allow us to choose the correct prompt."""
-from langfuse import get_client as get_langfuse_client, observe
 
 from homeassistant.components.conversation import (
     ChatLog,
@@ -15,10 +14,9 @@ from homeassistant.helpers import intent, llm
 from . import CustomConversationConfigEntry
 from .api import CustomLLMAPI
 from .const import DOMAIN, LLM_API_ID, LOGGER
-from .prompt_manager import PromptContext, PromptManager
+from .prompt_manager import LangfuseClient, PromptContext, PromptManager
 
 
-@observe(name="cc_update_llm_data", capture_input=False)
 async def async_update_llm_data(
     hass: HomeAssistant,
     user_input: ConversationInput,
@@ -26,6 +24,7 @@ async def async_update_llm_data(
     chat_log: ChatLog,
     prompt_manager: PromptManager,
     llm_api_name: str | None = None,
+    langfuse_client: LangfuseClient | None = None,
 ):
     """Process the incoming message for the LLM.
 
@@ -37,7 +36,7 @@ async def async_update_llm_data(
         platform=DOMAIN,
         context=user_input.context,
         language=user_input.language,
-        assistant="conversation", # Todo: Confirm
+        assistant="conversation",  # Todo: Confirm
         device_id=user_input.device_id,
     )
 
@@ -46,9 +45,7 @@ async def async_update_llm_data(
     if (
         user_input.context
         and user_input.context.user_id
-        and (
-            user := await hass.auth.async_get_user(user_input.context.user_id)
-            )
+        and (user := await hass.auth.async_get_user(user_input.context.user_id))
     ):
         user_name = user.name
 
@@ -63,13 +60,16 @@ async def async_update_llm_data(
                     user_name,
                     conversation_config_entry=config_entry,
                 )
-                if (
-                    langfuse_client := hass.data.get(DOMAIN,{})
-                    .get(config_entry.entry_id,{})
-                    .get("langfuse_client")
-                ):
+                api_langfuse_client = langfuse_client
+                if api_langfuse_client is None:
+                    api_langfuse_client = (
+                        hass.data.get(DOMAIN, {})
+                        .get(config_entry.entry_id, {})
+                        .get("langfuse_client")
+                    )
+                if api_langfuse_client is not None:
                     LOGGER.debug("Setting langfuse client for Custom LLM API")
-                    api_instance.set_langfuse_client(langfuse_client)
+                    api_instance.set_langfuse_client(api_langfuse_client)
                 llm_api = await api_instance.async_get_api_instance(llm_context)
             else:
                 LOGGER.debug("Using LLM API with ID %s", llm_api_name)
@@ -92,10 +92,10 @@ async def async_update_llm_data(
                 "Error preparing LLM API",
             )
             raise ConverseError(
-                    f"Error getting LLM API {llm_api_name}",
-                    conversation_id=chat_log.conversation_id,
-                    response=intent_response,
-                ) from err
+                f"Error getting LLM API {llm_api_name}",
+                conversation_id=chat_log.conversation_id,
+                response=intent_response,
+            ) from err
     prompt_object = None
     try:
         prompt_context = PromptContext(
@@ -158,7 +158,10 @@ async def async_update_llm_data(
     if extra_system_prompt:
         LOGGER.debug("Using extra system prompt: %s", extra_system_prompt)
         prompt += "\n" + extra_system_prompt
-        get_langfuse_client().update_current_span(metadata={"tags": ["extra_system_prompt"]})
+        if langfuse_client is not None:
+            langfuse_client.update_current_span(
+                metadata={"tags": ["extra_system_prompt"]}
+            )
 
     chat_log.llm_api = llm_api
     chat_log.extra_system_prompt = extra_system_prompt
@@ -168,6 +171,6 @@ async def async_update_llm_data(
         {
             "messages": chat_log.content,
             "tools": chat_log.llm_api.tools if chat_log.llm_api else None,
-        }
+        },
     )
     return prompt_object

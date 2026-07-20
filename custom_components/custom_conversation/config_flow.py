@@ -501,7 +501,17 @@ class CustomConversationOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
+        errors: dict[str, str] = {}
+        options = self.config_entry.options
         if user_input is not None:
+            langfuse_options = user_input.get(CONF_LANGFUSE_SECTION, {})
+            if langfuse_options.get(
+                CONF_LANGFUSE_SCORE_ENABLED, False
+            ) and not langfuse_options.get(CONF_LANGFUSE_TRACING_ENABLED, False):
+                errors["base"] = "langfuse_score_requires_tracing"
+                options = user_input
+
+        if user_input is not None and not errors:
             # Process user input before saving
             processed_input = {**user_input}  # Start with a copy
 
@@ -532,7 +542,6 @@ class CustomConversationOptionsFlow(OptionsFlow):
             return self.async_create_entry(title="", data=processed_input)
 
         # Build schema for options
-        options = self.config_entry.options
         hass = self.hass
         hass_apis = self._get_hass_apis(hass)
         intents = await self._get_intents(hass)
@@ -755,6 +764,7 @@ class CustomConversationOptionsFlow(OptionsFlow):
         return self.async_show_form(
             step_id="init",
             data_schema=schema,
+            errors=errors,
         )
 
     def _get_hass_apis(self, hass: HomeAssistant) -> list[SelectOptionDict]:

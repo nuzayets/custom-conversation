@@ -19,6 +19,7 @@ from custom_components.custom_conversation.const import (
     CONF_LANGFUSE_BASE_PROMPT_ID,
     CONF_LANGFUSE_HOST,
     CONF_LANGFUSE_PUBLIC_KEY,
+    CONF_LANGFUSE_SCORE_ENABLED,
     CONF_LANGFUSE_SECRET_KEY,
     CONF_LANGFUSE_SECTION,
     CONF_LANGFUSE_TRACING_ENABLED,
@@ -264,6 +265,45 @@ async def test_options_flow(hass: HomeAssistant, config_entry: MockConfigEntry):
         assert result["data"][CONF_LANGFUSE_SECTION][CONF_LANGFUSE_HOST] == "http://langfuse.test"
         assert result["data"][CONF_LANGFUSE_SECTION][CONF_LANGFUSE_BASE_PROMPT_ID] == "test-base-prompt-id"
         assert result["data"][CONF_LANGFUSE_SECTION][CONF_LANGFUSE_API_PROMPT_ID] == "test-api-prompt-id"
+
+
+async def test_options_flow_rejects_scoring_without_tracing(
+    hass: HomeAssistant,
+    config_entry: MockConfigEntry,
+):
+    """Test scoring cannot be enabled without creating conversation traces."""
+    config_entry.add_to_hass(hass)
+
+    with (
+        patch(
+            "custom_components.custom_conversation.async_setup",
+            return_value=True,
+        ),
+        patch(
+            "custom_components.custom_conversation.async_setup_entry",
+            return_value=True,
+        ),
+    ):
+        result = await hass.config_entries.options.async_init(config_entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            user_input={
+                CONF_AGENTS_SECTION: {
+                    CONF_ENABLE_HASS_AGENT: True,
+                    CONF_ENABLE_LLM_AGENT: True,
+                },
+                CONF_IGNORED_INTENTS_SECTION: {CONF_IGNORED_INTENTS: []},
+                CONF_CUSTOM_PROMPTS_SECTION: {},
+                CONF_LANGFUSE_SECTION: {
+                    CONF_ENABLE_LANGFUSE: False,
+                    CONF_LANGFUSE_TRACING_ENABLED: False,
+                    CONF_LANGFUSE_SCORE_ENABLED: True,
+                },
+            },
+        )
+
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "langfuse_score_requires_tracing"}
 
 async def test_options_flow_empty_fields_reset(hass: HomeAssistant, config_entry):
     """Test config flow options with empty fields reset to recommended (ignored intents empty selection is preserved, not reset)."""

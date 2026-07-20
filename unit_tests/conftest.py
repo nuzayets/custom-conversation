@@ -1,8 +1,4 @@
 """Fixtures for Custom Conversation tests."""
-from .test_helpers import setup_mocks
-
-setup_mocks()
-from unittest.mock import patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -72,9 +68,3 @@ def config_entry(hass: HomeAssistant) -> MockConfigEntry:
     hass.async_block_till_done()
     return entry
 
-@pytest.fixture(autouse=True)
-async def mock_langfuse_client():
-    """Mock LangfuseClient."""
-    with patch('custom_components.custom_conversation.prompt_manager.LangfuseClient') as mock_client:
-        mock_client.create.return_value = None
-        yield mock_client

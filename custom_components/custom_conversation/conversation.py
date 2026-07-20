@@ -3,12 +3,11 @@
 import ast
 import asyncio
 from collections.abc import AsyncGenerator, Callable
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from inspect import isawaitable
 import json
 from typing import TYPE_CHECKING, Any, Literal, Union, cast
-import warnings
-
-from langfuse import get_client as get_langfuse_client, observe, propagate_attributes
 
 if TYPE_CHECKING:
     from langfuse.model import PromptClient
@@ -36,6 +35,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import chat_session, device_registry as dr, intent, llm
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.json import ExtendedJSONEncoder
 
 from . import CustomConversationConfigEntry
 from .api import IntentTool
@@ -44,12 +44,8 @@ from .const import (
     CONF_AGENTS_SECTION,
     CONF_ENABLE_HASS_AGENT,
     CONF_ENABLE_LLM_AGENT,
-    CONF_LANGFUSE_HOST,
-    CONF_LANGFUSE_PUBLIC_KEY,
-    CONF_LANGFUSE_SECRET_KEY,
     CONF_LANGFUSE_SECTION,
     CONF_LANGFUSE_TAGS,
-    CONF_LANGFUSE_TRACING_ENABLED,
     CONF_MAX_TOKENS,
     CONF_PRIMARY_API_KEY,
     CONF_PRIMARY_BASE_URL,
@@ -72,15 +68,7 @@ from .const import (
     HOME_ASSISTANT_AGENT,
     LOGGER,
 )
-from .prompt_manager import PromptManager
-
-# Pinned litellm's success_handler model_dumps a streaming ModelResponse whose
-# Choices|StreamingChoices union doesn't discriminate; benign serializer noise.
-warnings.filterwarnings(
-    "ignore",
-    message=r"Pydantic serializer warnings:",
-    category=UserWarning,
-)
+from .prompt_manager import LangfuseClient, PromptManager
 
 # Max number of back and forth with the LLM to generate a response
 MAX_TOOL_ITERATIONS = 10
@@ -121,7 +109,9 @@ def _parse_tool_args(arguments: dict[str, Any]) -> dict[str, Any]:
     return {k: _fix_invalid_arguments(v) for k, v in arguments.items() if v}
 
 
-def _get_llm_details(messages: list[ChatCompletionMessageParam]) -> dict:
+def _get_llm_details(
+    messages: list[ChatCompletionMessageParam],
+) -> tuple[dict, list[str]]:
     """Get the LLM details from the messages."""
     llm_details = {}
     new_tags = []
@@ -175,7 +165,12 @@ async def async_setup_entry(
     prompt_manager = PromptManager(hass)
     if langfuse_client:
         prompt_manager.set_langfuse_client(langfuse_client)
-    agent = CustomConversationEntity(config_entry, prompt_manager, hass)
+    agent = CustomConversationEntity(
+        config_entry,
+        prompt_manager,
+        hass,
+        langfuse_client,
+    )
     async_add_entities([agent])
 
 
@@ -235,6 +230,7 @@ def _convert_content_to_param(
 
 async def _transform_litellm_stream(
     result: AsyncGenerator[StreamingChatCompletionChunk, None],
+    generation: Any | None,
 ) -> AsyncGenerator[AssistantContentDeltaDict, None]:
     """Transform a LiteLLM delta stream into HA format."""
     current_tool_call: dict | None = None
@@ -249,10 +245,10 @@ async def _transform_litellm_stream(
             LOGGER.debug("Received chunk: %s", chunk)
             if model is None and getattr(chunk, "model", None):
                 model = chunk.model
+            if chunk_usage := getattr(chunk, "usage", None):
+                usage = chunk_usage
+                LOGGER.debug("Received usage chunk: %s", chunk_usage)
             if not chunk.choices:
-                if chunk.usage:
-                    usage = chunk.usage
-                    LOGGER.debug("Received usage chunk: %s", chunk.usage)
                 continue
 
             choice = chunk.choices[0]
@@ -285,9 +281,7 @@ async def _transform_litellm_stream(
 
             delta = choice.delta
 
-            if completion_start_time is None and (
-                delta.content or delta.tool_calls
-            ):
+            if completion_start_time is None and (delta.content or delta.tool_calls):
                 completion_start_time = datetime.now(timezone.utc)
 
             if delta.content:
@@ -295,11 +289,13 @@ async def _transform_litellm_stream(
 
             # Yield messages that don't involve tool calls
             if current_tool_call is None and not delta.tool_calls:
-                yield {
+                content_delta = {
                     key: value
                     for key in ("role", "content")
                     if (value := getattr(delta, key)) is not None
                 }
+                if content_delta:
+                    yield content_delta
                 continue
 
             # When doing tool calls, we should always have a tool call
@@ -311,8 +307,13 @@ async def _transform_litellm_stream(
             ):
                 raise ValueError("Expected delta with tool call")
 
-            if current_tool_call and delta_tool_call.index == current_tool_call["index"]:
-                current_tool_call["tool_args"] += delta_tool_call.function.arguments or ""
+            if (
+                current_tool_call
+                and delta_tool_call.index == current_tool_call["index"]
+            ):
+                current_tool_call["tool_args"] += (
+                    delta_tool_call.function.arguments or ""
+                )
                 continue
 
             # We got a tool call with new index, so we need to yield the previous
@@ -344,7 +345,12 @@ async def _transform_litellm_stream(
                 "tool_args": delta_tool_call.function.arguments or "",
             }
     finally:
+        try:
+            await _async_close_stream(result)
+        except Exception:
+            LOGGER.debug("Failed to close LiteLLM stream", exc_info=True)
         _report_generation_to_langfuse(
+            generation=generation,
             content="".join(content_parts),
             tool_calls=completed_tool_calls,
             usage=usage,
@@ -353,8 +359,23 @@ async def _transform_litellm_stream(
         )
 
 
+async def _async_close_stream(stream: Any) -> None:
+    """Close an async stream, including older LiteLLM wrappers."""
+    close = getattr(stream, "aclose", None)
+    if not callable(close):
+        wrapped_stream = getattr(stream, "completion_stream", None)
+        close = getattr(wrapped_stream, "aclose", None)
+        if not callable(close):
+            close = getattr(wrapped_stream, "close", None)
+    if callable(close):
+        close_result = close()
+        if isawaitable(close_result):
+            await close_result
+
+
 def _report_generation_to_langfuse(
     *,
+    generation: Any | None,
     content: str,
     tool_calls: list[dict],
     usage: Any,
@@ -384,10 +405,16 @@ def _report_generation_to_langfuse(
         if usage_details:
             update_kwargs["usage_details"] = usage_details
 
+    if generation is not None:
+        _update_observation(generation, **update_kwargs)
+
+
+def _update_observation(observation: Any, **kwargs: Any) -> None:
+    """Update an observation without failing the conversation."""
     try:
-        get_langfuse_client().update_current_generation(**update_kwargs)
-    except Exception:  # noqa: BLE001 — telemetry must not fail the conversation
-        LOGGER.debug("Failed to update langfuse generation span", exc_info=True)
+        observation.update(**kwargs)
+    except Exception:
+        LOGGER.debug("Failed to update Langfuse observation", exc_info=True)
 
 
 async def _remove_failed_hass_agent_messages(
@@ -395,8 +422,10 @@ async def _remove_failed_hass_agent_messages(
 ) -> list[conversation.Content]:
     """Remove failed messages from the HASS agent."""
     # If the last two messages are AssistantContent followed by UserContent, remove them
-    if len(content) >= 2 and isinstance(content[-1], AssistantContent) and isinstance(
-        content[-2], UserContent
+    if (
+        len(content) >= 2
+        and isinstance(content[-1], AssistantContent)
+        and isinstance(content[-2], UserContent)
     ):
         content = content[:-2]
     return content
@@ -416,6 +445,7 @@ class CustomConversationEntity(
         entry: CustomConversationConfigEntry,
         prompt_manager: PromptManager,
         hass: HomeAssistant,
+        langfuse_client: LangfuseClient | None = None,
     ) -> None:
         """Initialize the agent."""
         self.entry = entry
@@ -433,27 +463,26 @@ class CustomConversationEntity(
                 conversation.ConversationEntityFeature.CONTROL
             )
         self.prompt_manager = prompt_manager
+        self._langfuse_client = langfuse_client
         self._router: Router | None = None
         self._router_lock = asyncio.Lock()
-        if entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
-            CONF_LANGFUSE_TRACING_ENABLED, False
-        ):
-            try:
-                from langfuse import Langfuse
 
-                hass.async_add_executor_job(
-                    lambda: Langfuse(
-                        host=entry.options[CONF_LANGFUSE_SECTION][CONF_LANGFUSE_HOST],
-                        public_key=entry.options[CONF_LANGFUSE_SECTION][
-                            CONF_LANGFUSE_PUBLIC_KEY
-                        ],
-                        secret_key=entry.options[CONF_LANGFUSE_SECTION][
-                            CONF_LANGFUSE_SECRET_KEY
-                        ],
-                    )
-                )
-            except ValueError as e:
-                LOGGER.error("Error configuring langfuse: %s", e)
+    def _observe(self, **kwargs: Any):
+        """Start an observation on this entry's Langfuse client."""
+        if self._langfuse_client is None:
+            return nullcontext()
+        return self._langfuse_client.observe(**kwargs)
+
+    def _propagate(self, **kwargs: Any):
+        """Propagate attributes on this entry's Langfuse client."""
+        if self._langfuse_client is None:
+            return nullcontext()
+        return self._langfuse_client.propagate(**kwargs)
+
+    def _update_current_span(self, **kwargs: Any) -> None:
+        """Update this entry's active span."""
+        if self._langfuse_client is not None:
+            self._langfuse_client.update_current_span(**kwargs)
 
     @property
     def supported_languages(self) -> list[str] | Literal["*"]:
@@ -473,14 +502,59 @@ class CustomConversationEntity(
         conversation.async_unset_agent(self.hass, self.entry)
         await super().async_will_remove_from_hass()
 
-    @observe(name="cc_async_process")
     async def async_process(
         self, user_input: conversation.ConversationInput
     ) -> conversation.ConversationResult:
         """Process a sentence."""
-        return await self._async_handle_message(user_input)
+        trace_input = {
+            "agent_id": user_input.agent_id,
+            "conversation_id": user_input.conversation_id,
+            "device_id": user_input.device_id,
+            "language": user_input.language,
+            "text": user_input.text,
+        }
+        device = dr.async_get(self.hass).async_get(user_input.device_id)
+        trace_tags = list(
+            self.entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
+                CONF_LANGFUSE_TAGS, []
+            )
+        )
+        trace_tags.extend(
+            (
+                f"device_id:{user_input.device_id}",
+                f"device_name:{device.name if device else 'Unknown'}",
+                f"device_area:{device.area_id if device else 'Unknown'}",
+            )
+        )
+        with (
+            self._propagate(tags=trace_tags),
+            self._observe(
+                name="cc_async_process",
+                input=trace_input,
+            ) as observation,
+        ):
+            try:
+                result = await self._async_handle_message(user_input)
+            except asyncio.CancelledError:
+                if observation is not None:
+                    _update_observation(
+                        observation,
+                        level="WARNING",
+                        status_message="Conversation cancelled",
+                    )
+                raise
+            except Exception as err:
+                if observation is not None:
+                    _update_observation(
+                        observation,
+                        level="ERROR",
+                        status_message=str(err),
+                    )
+                raise
+            if observation is not None:
+                _update_observation(observation, output=result.as_dict())
+            return result
 
-    @observe(name="cc_handle_message")
     async def _async_handle_message(
         self,
         user_input: conversation.ConversationInput,
@@ -506,7 +580,7 @@ class CustomConversationEntity(
         )
         new_tags = user_configured_tags + device_tags
 
-        with propagate_attributes(tags=new_tags):
+        with self._propagate(tags=new_tags):
             event_data = {
                 "agent_id": user_input.agent_id,
                 "conversation_id": user_input.conversation_id,
@@ -547,14 +621,22 @@ class CustomConversationEntity(
                         )
                         hass_tags = ["handling_agent:home_assistant"]
                         if result.response.intent.intent_type is not None:
-                            hass_tags.append(f"intent:{result.response.intent.intent_type}")
+                            hass_tags.append(
+                                f"intent:{result.response.intent.intent_type}"
+                            )
                         if len(result.response.success_results) > 0:
                             hass_tags.extend(
                                 f"affected_entity:{success_result.id}"
                                 for success_result in result.response.success_results
                             )
-                        get_langfuse_client().update_current_span(output=result.as_dict())
-                        with propagate_attributes(tags=hass_tags):
+                        self._update_current_span(output=result.as_dict())
+                        with (
+                            self._propagate(tags=hass_tags),
+                            self._observe(
+                                name="cc_hass_result",
+                                output=result.as_dict(),
+                            ),
+                        ):
                             pass
                         return conversation.ConversationResult(
                             response=result.response,
@@ -576,7 +658,10 @@ class CustomConversationEntity(
                         async_get_chat_log(self.hass, session, user_input) as chat_log,
                     ):
                         LOGGER.debug("Trying to handle the message with LLM")
-                        result, llm_data = await self._async_handle_message_with_llm(
+                        (
+                            result,
+                            llm_data,
+                        ) = await self._async_handle_message_with_llm(
                             user_input, chat_log
                         )
                         LOGGER.debug("Received response: %s", result.response.speech)
@@ -588,8 +673,15 @@ class CustomConversationEntity(
                                 llm_data=llm_data,
                                 device_data=device_data,
                             )
-                            with propagate_attributes(tags=["handling_agent:llm"]):
+                            with (
+                                self._propagate(tags=["handling_agent:llm"]),
+                                self._observe(
+                                    name="cc_llm_handled",
+                                    output=result.as_dict(),
+                                ),
+                            ):
                                 pass
+
                         else:
                             await self._async_fire_conversation_error(
                                 result.response.error_code,
@@ -605,7 +697,9 @@ class CustomConversationEntity(
                         user_input,
                         device_data=device_data,
                     )
-                    raise HomeAssistantError("Rate limited or insufficient funds") from err
+                    raise HomeAssistantError(
+                        "Rate limited or insufficient funds"
+                    ) from err
                 except OpenAIError as err:
                     error_message = getattr(err, "body", str(err))
                     await self._async_fire_conversation_error(
@@ -617,7 +711,6 @@ class CustomConversationEntity(
                     raise HomeAssistantError("Error talking to OpenAI API") from err
             return result
 
-    @observe(name="cc_handle_message_with_hass")
     async def _async_handle_message_with_hass(
         self,
         user_input: conversation.ConversationInput,
@@ -630,9 +723,7 @@ class CustomConversationEntity(
                 intent.IntentResponseErrorCode.UNKNOWN,
                 "Sorry, I had a problem talking to Home Assistant",
             )
-            get_langfuse_client().update_current_span(
-                output=intent_response.as_dict()
-            )
+            self._update_current_span(output=intent_response.as_dict())
             return conversation.ConversationResult(
                 response=intent_response, conversation_id=user_input.conversation_id
             )
@@ -657,10 +748,9 @@ class CustomConversationEntity(
             LOGGER.debug(
                 "Hass agent responded with error_code: %s", response.response.error_code
             )
-        get_langfuse_client().update_current_span(output=response.as_dict())
+        self._update_current_span(output=response.as_dict())
         return response
 
-    @observe(name="cc_handle_message_with_llm")
     async def _async_handle_message_with_llm(
         self,
         user_input: conversation.ConversationInput,
@@ -680,6 +770,7 @@ class CustomConversationEntity(
                 chat_log,
                 self.prompt_manager,
                 llm_api,
+                self._langfuse_client,
             )
             if prompt_object:
                 LOGGER.debug(
@@ -708,7 +799,7 @@ class CustomConversationEntity(
         # To prevent infinite loops, we limit the number of iterations
         for _iteration in range(MAX_TOOL_ITERATIONS):
             LOGGER.debug("Iteration %s, messages: %s", _iteration, messages)
-            transformed_stream = await self._async_generate_completion(
+            transformed_stream = self._async_generate_completion(
                 entry=self.entry,
                 messages=messages,
                 tools=tools,
@@ -727,6 +818,8 @@ class CustomConversationEntity(
                 )
             except HomeAssistantError as err:
                 LOGGER.error("Error processing LLM stream: %s", err)
+                raise
+            except (RateLimitError, OpenAIError):
                 raise
             except Exception as err:
                 LOGGER.error("Unexpected error processing LLM stream: %s", err)
@@ -748,8 +841,15 @@ class CustomConversationEntity(
         intent_response.async_set_speech(final_assistant_message.content or "")
 
         llm_details, new_tags = _get_llm_details(messages)
-        with propagate_attributes(tags=new_tags):
-            pass
+        if new_tags:
+            with (
+                self._propagate(tags=new_tags),
+                self._observe(
+                    name="cc_llm_result",
+                    output=llm_details,
+                ),
+            ):
+                pass
 
         return conversation.ConversationResult(
             response=intent_response,
@@ -757,9 +857,7 @@ class CustomConversationEntity(
             continue_conversation=chat_log.continue_conversation,
         ), llm_details
 
-    async def _async_get_router(
-        self, entry: CustomConversationConfigEntry
-    ) -> Router:
+    async def _async_get_router(self, entry: CustomConversationConfigEntry) -> Router:
         """Return the cached Router, building it off the event loop on first use.
 
         litellm.Router does synchronous import_module calls during construction
@@ -804,12 +902,6 @@ class CustomConversationEntity(
             fallbacks = [{primary_model: [secondary_model]}]
         return Router(model_list=model_list, fallbacks=fallbacks)
 
-    @observe(
-        name="cc_generate_completion",
-        as_type="generation",
-        capture_input=False,
-        capture_output=False,
-    )
     async def _async_generate_completion(
         self,
         entry: CustomConversationConfigEntry,
@@ -818,28 +910,27 @@ class CustomConversationEntity(
         conversation_id: str,
         prompt: Union["PromptClient", None] = None,
     ) -> AsyncGenerator[AssistantContentDeltaDict, None]:
-        """Generate a completion stream from the LLM."""
-        cleaned_input = {
-            "messages": messages,
-            "tools": tools,
-            "conversation_id": conversation_id,
-            "prompt": prompt.__dict__ if prompt else None,
-            "config_entry": {
-                "entry_id": entry.entry_id,
-                "title": entry.title,
-                "options": {**entry.options},
-            },
-        }
-        get_langfuse_client().update_current_span(
-            input=cleaned_input,
-        )
+        """Generate a completion while owning its observation through streaming."""
         primary_model = f"{entry.data.get(CONF_PRIMARY_PROVIDER)}/{entry.data.get(CONF_PRIMARY_CHAT_MODEL)}"
-        router = await self._async_get_router(entry)
-
         temperature = entry.options.get(CONF_TEMPERATURE, DEFAULT_TEMPERATURE)
         top_p = entry.options.get(CONF_TOP_P, DEFAULT_TOP_P)
         max_tokens = entry.options.get(CONF_MAX_TOKENS, DEFAULT_MAX_TOKENS)
-
+        prompt_metadata = None
+        if prompt is not None:
+            prompt_metadata = {
+                "name": getattr(prompt, "name", None),
+                "version": getattr(prompt, "version", None),
+            }
+        trace_input = {
+            "messages": messages,
+            "tools": tools,
+            "conversation_id": conversation_id,
+            "prompt": prompt_metadata,
+            "config_entry": {
+                "entry_id": entry.entry_id,
+                "title": entry.title,
+            },
+        }
         completion_kwargs = {
             "model": primary_model,
             "messages": messages,
@@ -852,33 +943,85 @@ class CustomConversationEntity(
             "stream_options": {"include_usage": True},
         }
 
-        try:
-            raw_stream: AsyncGenerator[
-                StreamingChatCompletionChunk
-            ] = await router.acompletion(**completion_kwargs)
-            get_langfuse_client().update_current_span(metadata={"prompt": prompt.__dict__ if prompt else None})
-
-            return _transform_litellm_stream(raw_stream)
-
-        except RateLimitError as err:
-            LOGGER.error("Rate limit error during acompletion: %s", err)
-            raise
-        except OpenAIError as err:
-            LOGGER.error("API error during acompletion: %s", err)
-            raise
-        except Exception as err:
-            LOGGER.error(
-                "Unexpected error generating completion with acompletion: %s", err
-            )
-            debug_kwargs = {
-                k: v
-                for k, v in completion_kwargs.items()
-                if k not in ["api_key", "langfuse_secret_key"]
-            }
-            LOGGER.debug(
-                "acompletion kwargs (sensitive info removed): %s", debug_kwargs
-            )
-            raise HomeAssistantError("Error generating LLM completion stream") from err
+        with self._observe(
+            name="cc_generate_completion",
+            as_type="generation",
+            input=trace_input,
+            model=primary_model,
+            model_parameters={
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+            },
+            prompt=prompt,
+        ) as generation:
+            transformed_stream = None
+            try:
+                router = await self._async_get_router(entry)
+                raw_stream: AsyncGenerator[
+                    StreamingChatCompletionChunk
+                ] = await router.acompletion(**completion_kwargs)
+                transformed_stream = _transform_litellm_stream(raw_stream, generation)
+                async for delta in transformed_stream:
+                    yield delta
+            except (asyncio.CancelledError, GeneratorExit):
+                if generation is not None:
+                    _update_observation(
+                        generation,
+                        level="WARNING",
+                        status_message="Generation cancelled",
+                    )
+                raise
+            except RateLimitError as err:
+                if generation is not None:
+                    _update_observation(
+                        generation,
+                        level="ERROR",
+                        status_message=str(err),
+                    )
+                LOGGER.error("Rate limit error during acompletion: %s", err)
+                raise
+            except OpenAIError as err:
+                if generation is not None:
+                    _update_observation(
+                        generation,
+                        level="ERROR",
+                        status_message=str(err),
+                    )
+                LOGGER.error("API error during acompletion: %s", err)
+                raise
+            except Exception as err:
+                if generation is not None:
+                    _update_observation(
+                        generation,
+                        level="ERROR",
+                        status_message=str(err),
+                    )
+                LOGGER.error(
+                    "Unexpected error generating completion with acompletion: %s",
+                    err,
+                )
+                debug_kwargs = {
+                    key: value
+                    for key, value in completion_kwargs.items()
+                    if key not in ("api_key", "langfuse_secret_key")
+                }
+                LOGGER.debug(
+                    "acompletion kwargs (sensitive info removed): %s",
+                    debug_kwargs,
+                )
+                raise HomeAssistantError(
+                    "Error generating LLM completion stream"
+                ) from err
+            finally:
+                if transformed_stream is not None:
+                    try:
+                        await _async_close_stream(transformed_stream)
+                    except Exception:
+                        LOGGER.debug(
+                            "Failed to close transformed completion stream",
+                            exc_info=True,
+                        )
 
     async def _async_entry_update_listener(
         self, hass: HomeAssistant, entry: ConfigEntry

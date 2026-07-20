@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+import asyncio
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal
 
-from langfuse import Langfuse
-from langfuse.api import CreateScoreConfigRequest, ScoreConfigDataType
+from langfuse import Langfuse, propagate_attributes
+from langfuse.api import ConfigCategory, ScoreConfigDataType
 from langfuse.model import Prompt
-from langfuse import observe
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import TemplateError
 from homeassistant.helpers import template
-from homeassistant.util import yaml as yaml_util, dt as dt_util
+from homeassistant.util import dt as dt_util, yaml as yaml_util
 
 from .const import (
     CONF_API_PROMPT_BASE,
@@ -46,11 +47,30 @@ from .const import (
     DEFAULT_BASE_PROMPT,
     DEFAULT_INSTRUCTIONS_PROMPT,
     DEFAULT_PROMPT_NO_ENABLED_ENTITIES,
+    DOMAIN,
     LANGFUSE_SCORE_NAME,
     LANGFUSE_SCORE_NEGATIVE,
     LANGFUSE_SCORE_POSITIVE,
     LOGGER,
 )
+
+_LANGFUSE_RESOURCES = "langfuse_resources"
+_LANGFUSE_RESOURCE_LOCK = "langfuse_resource_lock"
+_LANGFUSE_CLOUD_URL = "https://cloud.langfuse.com"
+
+
+@dataclass
+class _LangfuseResource:
+    """Shared SDK resource for entries using the same Langfuse project."""
+
+    client: Langfuse
+    host: str | None
+    secret_key: str
+    references: int = 1
+    score_config_id: str | None = None
+    score_config_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    score_config_task: asyncio.Task[str] | None = None
+    flush_task: asyncio.Task[None] | None = None
 
 
 class LangfuseError(Exception):
@@ -59,6 +79,10 @@ class LangfuseError(Exception):
 
 class LangfuseInitError(LangfuseError):
     """Error initializing Langfuse client."""
+
+
+class LangfuseResourceConflictError(LangfuseInitError):
+    """Error raised when an SDK singleton has conflicting credentials."""
 
 
 class LangfusePromptError(LangfuseError):
@@ -97,7 +121,6 @@ class PromptManager:
             key, default
         )
 
-    @observe(capture_input=False)
     async def _get_langfuse_prompt(
         self, prompt_id: str, variables: dict[str, Any]
     ) -> tuple[Prompt, str] | None:
@@ -111,7 +134,6 @@ class PromptManager:
             LOGGER.error("Error getting Langfuse prompt: %s", err)
             return None
 
-    @observe(capture_input=False)
     async def async_get_base_prompt(
         self, context: PromptContext, config_entry: ConfigEntry | None = None
     ) -> tuple[Prompt, str] | str:
@@ -158,7 +180,6 @@ class PromptManager:
             LOGGER.error("Error rendering base prompt: %s", err)
             raise
 
-    @observe(capture_input=False)
     async def get_api_prompt(
         self, context: PromptContext, config_entry: ConfigEntry | None = None
     ) -> tuple[Prompt, str] | str:
@@ -267,113 +288,358 @@ class LangfuseClient:
         hass: HomeAssistant,
         client: Langfuse,
         prompts: dict,
+        tracing_enabled: bool,
         score_config_id: str | None = None,
+        resource_key: str | None = None,
     ) -> None:
         """Initialize the client."""
         self._client = client
         self.hass = hass
         self.prompts = prompts
+        self.tracing_enabled = tracing_enabled
         self.score_config_id = score_config_id
-        self.score_config_id = score_config_id
+        self._resource_key = resource_key
+        self._managed_resource = resource_key is not None
+        self._released = False
+        self._cleanup_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _resource_state(hass: HomeAssistant):
+        domain_data = hass.data.setdefault(DOMAIN, {})
+        resources = domain_data.setdefault(_LANGFUSE_RESOURCES, {})
+        lock = domain_data.setdefault(_LANGFUSE_RESOURCE_LOCK, asyncio.Lock())
+        return resources, lock
+
+    @classmethod
+    async def _acquire_sdk_client(
+        cls,
+        hass: HomeAssistant,
+        langfuse_options: dict[str, Any],
+    ) -> tuple[Langfuse, str]:
+        public_key = langfuse_options[CONF_LANGFUSE_PUBLIC_KEY]
+        secret_key = langfuse_options[CONF_LANGFUSE_SECRET_KEY]
+        host = langfuse_options.get(CONF_LANGFUSE_HOST) or _LANGFUSE_CLOUD_URL
+        resources, lock = cls._resource_state(hass)
+        async with lock:
+            if resource := resources.get(public_key):
+                if resource.host != host or resource.secret_key != secret_key:
+                    raise LangfuseResourceConflictError(
+                        "Langfuse credentials changed for an active SDK resource"
+                    )
+                resource.references += 1
+                return resource.client, public_key
+
+            async def create_client() -> Langfuse:
+                return await hass.async_add_executor_job(
+                    lambda: Langfuse(
+                        public_key=public_key,
+                        secret_key=secret_key,
+                        base_url=host,
+                        tracing_enabled=True,
+                    )
+                )
+
+            client_job = hass.async_create_task(
+                create_client(),
+                name=f"{DOMAIN} Langfuse client construction",
+                eager_start=False,
+            )
+            try:
+                client = await asyncio.shield(client_job)
+            except asyncio.CancelledError as cancellation:
+                try:
+                    client = await client_job
+                except Exception as err:
+                    raise cancellation from err
+                resources[public_key] = _LangfuseResource(
+                    client=client,
+                    host=host,
+                    secret_key=secret_key,
+                    references=0,
+                )
+                raise
+            resources[public_key] = _LangfuseResource(
+                client=client,
+                host=host,
+                secret_key=secret_key,
+            )
+            return client, public_key
+
+    @classmethod
+    async def _release_sdk_client(
+        cls,
+        hass: HomeAssistant,
+        resource_key: str,
+    ) -> None:
+        resources, lock = cls._resource_state(hass)
+        flush_task = None
+        async with lock:
+            resource = resources.get(resource_key)
+            if resource is None:
+                return
+            resource.references -= 1
+            if resource.references == 0:
+                if resource.flush_task is None or resource.flush_task.done():
+                    resource.flush_task = hass.async_create_task(
+                        cls._flush_resource(hass, resource),
+                        name=f"{DOMAIN} Langfuse flush",
+                        eager_start=False,
+                    )
+                flush_task = resource.flush_task
+        if flush_task is not None:
+            await asyncio.shield(flush_task)
+
+    @staticmethod
+    async def _flush_resource(
+        hass: HomeAssistant,
+        resource: _LangfuseResource,
+    ) -> None:
+        await hass.async_add_executor_job(resource.client.flush)
+
+    @classmethod
+    async def _ensure_score_config(
+        cls,
+        hass: HomeAssistant,
+        resource_key: str,
+    ) -> str:
+        resources, lock = cls._resource_state(hass)
+        async with lock:
+            resource = resources[resource_key]
+        async with resource.score_config_lock:
+            if resource.score_config_id is not None:
+                return resource.score_config_id
+            if resource.score_config_task is None:
+                resource.score_config_task = hass.async_create_task(
+                    cls._initialize_score_config(hass, resource),
+                    name=f"{DOMAIN} score configuration",
+                    eager_start=False,
+                )
+                resource.score_config_task.add_done_callback(
+                    lambda task: cls._score_config_task_done(resource, task)
+                )
+            score_config_task = resource.score_config_task
+        return await asyncio.shield(score_config_task)
+
+    @staticmethod
+    def _score_config_task_done(
+        resource: _LangfuseResource,
+        task: asyncio.Task[str],
+    ) -> None:
+        if task.cancelled():
+            if resource.score_config_task is task:
+                resource.score_config_task = None
+            return
+        if task.exception() is not None and resource.score_config_task is task:
+            resource.score_config_task = None
+
+    @staticmethod
+    async def _initialize_score_config(
+        hass: HomeAssistant,
+        resource: _LangfuseResource,
+    ) -> str:
+        score_configs = await hass.async_add_executor_job(
+            resource.client.api.score_configs.get
+        )
+        score_config = next(
+            (
+                score
+                for score in score_configs.data
+                if score.name == LANGFUSE_SCORE_NAME
+            ),
+            None,
+        )
+        if score_config is None:
+            score_config = await hass.async_add_executor_job(
+                lambda: resource.client.api.score_configs.create(
+                    name=LANGFUSE_SCORE_NAME,
+                    data_type=ScoreConfigDataType.CATEGORICAL,
+                    categories=[
+                        ConfigCategory(
+                            label=LANGFUSE_SCORE_POSITIVE,
+                            value=1,
+                        ),
+                        ConfigCategory(
+                            label=LANGFUSE_SCORE_NEGATIVE,
+                            value=0,
+                        ),
+                    ],
+                    description="Score for Custom Conversation Home Assistant integration",
+                )
+            )
+        resource.score_config_id = score_config.id
+        return resource.score_config_id
+
+    @classmethod
+    async def shutdown_all(cls, hass: HomeAssistant) -> None:
+        """Shut down shared SDK resources when Home Assistant stops."""
+        resources, lock = cls._resource_state(hass)
+        async with lock:
+            retained_resources = list(resources.values())
+            resources.clear()
+        for resource in retained_resources:
+            if resource.score_config_task is not None:
+                try:
+                    await resource.score_config_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    LOGGER.warning(
+                        "Error finishing Langfuse score configuration",
+                        exc_info=True,
+                    )
+            if resource.flush_task is not None:
+                try:
+                    await resource.flush_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    LOGGER.warning(
+                        "Error finishing Langfuse flush",
+                        exc_info=True,
+                    )
+            try:
+                await hass.async_add_executor_job(resource.client.shutdown)
+            except Exception:
+                LOGGER.warning(
+                    "Error shutting down Langfuse resource",
+                    exc_info=True,
+                )
 
     @classmethod
     async def create(
         cls, hass: HomeAssistant, config_entry: ConfigEntry
     ) -> LangfuseClient | None:
         """Create a Langfuse client instance."""
-        if not config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
-            CONF_ENABLE_LANGFUSE
-        ):
+        langfuse_options = config_entry.options.get(CONF_LANGFUSE_SECTION, {})
+        prompts_enabled = langfuse_options.get(CONF_ENABLE_LANGFUSE, False)
+        tracing_enabled = langfuse_options.get(CONF_LANGFUSE_TRACING_ENABLED, False)
+        score_enabled = langfuse_options.get(CONF_LANGFUSE_SCORE_ENABLED, False)
+        if not (prompts_enabled or tracing_enabled or score_enabled):
             return None
+        if score_enabled and not tracing_enabled:
+            raise LangfuseInitError("Langfuse scoring requires tracing")
+        if not langfuse_options.get(
+            CONF_LANGFUSE_PUBLIC_KEY
+        ) or not langfuse_options.get(CONF_LANGFUSE_SECRET_KEY):
+            raise LangfuseInitError(
+                "Langfuse public and secret keys are required when Langfuse is enabled"
+            )
         # Set up prompt dictionary from config entry
         prompts = {
-            config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
-                CONF_LANGFUSE_BASE_PROMPT_ID
-            ): config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
+            langfuse_options.get(CONF_LANGFUSE_BASE_PROMPT_ID): langfuse_options.get(
                 CONF_LANGFUSE_BASE_PROMPT_LABEL, "production"
             ),
-            config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
-                CONF_LANGFUSE_API_PROMPT_ID
-            ): config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
+            langfuse_options.get(CONF_LANGFUSE_API_PROMPT_ID): langfuse_options.get(
                 CONF_LANGFUSE_API_PROMPT_LABEL, "production"
             ),
         }
+        client: Langfuse | None = None
+        resource_key: str | None = None
         try:
-
-            def create_client() -> Langfuse:
-                return Langfuse(
-                    public_key=config_entry.options[CONF_LANGFUSE_SECTION][
-                        CONF_LANGFUSE_PUBLIC_KEY
-                    ],
-                    secret_key=config_entry.options[CONF_LANGFUSE_SECTION][
-                        CONF_LANGFUSE_SECRET_KEY
-                    ],
-                    host=config_entry.options[CONF_LANGFUSE_SECTION].get(
-                        CONF_LANGFUSE_HOST
-                    ),
+            client, resource_key = await cls._acquire_sdk_client(
+                hass,
+                langfuse_options,
+            )
+            score_config_id = None
+            if score_enabled:
+                score_config_id = await cls._ensure_score_config(
+                    hass,
+                    resource_key,
                 )
-
-            client = await hass.async_add_executor_job(create_client)
-            score_config = None
-            # Ensure the score config is created if it's enabled
-            if config_entry.options.get(CONF_LANGFUSE_SECTION, {}).get(
-                CONF_LANGFUSE_SCORE_ENABLED
-            ):
-                score_configs = await hass.async_add_executor_job(
-                    client.api.score_configs.get
-                )
-                score_config = next(
-                    (
-                        score
-                        for score in score_configs.data
-                        if score.name == LANGFUSE_SCORE_NAME
-                    ),
-                    None,
-                )
-                if not score_config:
-                    score_config_request = CreateScoreConfigRequest(
-                        name=LANGFUSE_SCORE_NAME,
-                        data_type=ScoreConfigDataType.CATEGORICAL,
-                        categories=[
-                            {
-                                "label": LANGFUSE_SCORE_POSITIVE,
-                                "value": 1,
-                            },
-                            {
-                                "label": LANGFUSE_SCORE_NEGATIVE,
-                                "value": 0,
-                            },
-                        ],
-                        description="Score for Custom Conversation Home Assistant integration",
+            return cls(
+                hass,
+                client,
+                prompts,
+                tracing_enabled,
+                score_config_id,
+                resource_key,
+            )
+        except asyncio.CancelledError:
+            if resource_key is not None:
+                try:
+                    await cls._release_sdk_client(hass, resource_key)
+                except Exception:
+                    LOGGER.warning(
+                        "Error rolling back cancelled Langfuse initialization",
+                        exc_info=True,
                     )
-                    score_config = await hass.async_add_executor_job(
-                        lambda: client.api.score_configs.create(
-                            request=score_config_request
-                        )
-                    )
-            return cls(hass, client, prompts, score_config.id if score_config else None)
+            raise
         except Exception as err:
+            if resource_key is not None:
+                try:
+                    await cls._release_sdk_client(hass, resource_key)
+                except Exception:
+                    LOGGER.warning(
+                        "Error cleaning up partially initialized Langfuse client",
+                        exc_info=True,
+                    )
             LOGGER.error("Error initializing Langfuse client: %s", err)
+            if isinstance(err, LangfuseInitError):
+                raise
             raise LangfuseInitError("Failed to initialize Langfuse client") from err
 
-    @observe(capture_input=False)
     async def get_prompt(
         self, prompt_id: str, variables: dict[str, Any]
     ) -> tuple[Prompt, str]:
         """Get and compile a prompt from Langfuse."""
-        try:
-            # Get the prompt object in an executor
-            prompt_object = await self.hass.async_add_executor_job(
-                lambda: self._client.get_prompt(
-                    prompt_id, label=self.prompts[prompt_id], type="chat"
+        with self.observe(
+            name="cc_get_langfuse_prompt",
+            input={"prompt_id": prompt_id},
+        ) as observation:
+            try:
+                prompt_object = await self.hass.async_add_executor_job(
+                    lambda: self._client.get_prompt(
+                        prompt_id, label=self.prompts[prompt_id], type="chat"
+                    )
                 )
-            )
-            # Compile the prompt in an executor
-            compiled_prompt = prompt_object.compile(**variables)[0]["content"]
-        except Exception as err:
-            LOGGER.error("Error getting Langfuse prompt: %s", err)
-            raise LangfusePromptError(f"Failed to get Langfuse prompt: {err}") from err
+                compiled_prompt = prompt_object.compile(**variables)[0]["content"]
+                if observation is not None:
+                    observation.update(output={"prompt_id": prompt_id})
+            except Exception as err:
+                if observation is not None:
+                    observation.update(level="ERROR", status_message=str(err))
+                LOGGER.error("Error getting Langfuse prompt: %s", err)
+                raise LangfusePromptError(
+                    f"Failed to get Langfuse prompt: {err}"
+                ) from err
         return prompt_object, compiled_prompt
+
+    def observe(
+        self,
+        *,
+        name: str,
+        as_type: Literal["span", "generation"] = "span",
+        **kwargs: Any,
+    ) -> AbstractContextManager[Any]:
+        """Start an observation on this entry's client."""
+        if not self.tracing_enabled:
+            return nullcontext()
+        return self._client.start_as_current_observation(
+            name=name,
+            as_type=as_type,
+            **kwargs,
+        )
+
+    def propagate(self, **kwargs: Any) -> AbstractContextManager[Any]:
+        """Propagate attributes within this entry's active trace."""
+        if not self.tracing_enabled:
+            return nullcontext()
+        return propagate_attributes(**kwargs)
+
+    def update_current_span(self, **kwargs: Any) -> None:
+        """Update this entry's current span without affecting the conversation."""
+        if not self.tracing_enabled:
+            return
+        try:
+            self._client.update_current_span(**kwargs)
+        except Exception:
+            LOGGER.debug("Failed to update Langfuse span", exc_info=True)
+
+    def get_current_trace_id(self) -> str | None:
+        """Return this entry's current trace ID."""
+        if not self.tracing_enabled:
+            return None
+        return self._client.get_current_trace_id()
 
     async def score(self, score: str, device_id: str) -> None:
         """Score a conversation using Langfuse."""
@@ -384,10 +650,13 @@ class LangfuseClient:
         try:
             # Get the latest trace that matches this device
             traces = await self.hass.async_add_executor_job(
-                lambda: self._client.get_traces(
-                    name="cc_process",
+                lambda: self._client.api.trace.list(
+                    name="cc_async_process",
                     tags=f"device_id:{device_id}",
-                    from_timestamp=(datetime.now() - timedelta(minutes=10)),
+                    from_timestamp=(
+                        datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+                    ),
+                    limit=1,
                 )
             )
             LOGGER.debug("Traces found for device %s: %s", device_id, traces.data)
@@ -399,7 +668,7 @@ class LangfuseClient:
             LOGGER.debug("Scoring trace %s with score %s", latest_trace.id, score)
 
             await self.hass.async_add_executor_job(
-                lambda: self._client.score(
+                lambda: self._client.create_score(
                     name=LANGFUSE_SCORE_NAME,
                     value=score,
                     comment="Score based on Home Assistant Service Call",
@@ -412,9 +681,28 @@ class LangfuseClient:
 
     async def cleanup(self) -> None:
         """Clean up Langfuse client resources."""
-        if self._client:
-            try:
-                # Flush any pending data and stop the consumer thread
-                await self.hass.async_add_executor_job(self._client.flush)
-            except Exception as err:
-                LOGGER.warning("Error cleaning up Langfuse client: %s", err)
+        if self._released:
+            return
+        if self._cleanup_task is None:
+            self._cleanup_task = self.hass.async_create_task(
+                self._async_cleanup(),
+                name=f"{DOMAIN} Langfuse cleanup",
+                eager_start=False,
+            )
+        await asyncio.shield(self._cleanup_task)
+
+    async def _async_cleanup(self) -> None:
+        """Release this wrapper's resource exactly once."""
+        try:
+            if self._managed_resource:
+                if self._resource_key is not None:
+                    await self._release_sdk_client(
+                        self.hass,
+                        self._resource_key,
+                    )
+            elif self._client is not None:
+                await self.hass.async_add_executor_job(self._client.shutdown)
+        except Exception as err:
+            LOGGER.warning("Error cleaning up Langfuse client: %s", err)
+        finally:
+            self._released = True
