@@ -10,9 +10,10 @@ home-assistant-intents = "==2026.8.28"
 mutagen = "*"
 ha-ffmpeg = "*"
 langfuse = "==4.0.0"
-litellm = ">=1.80.0"
+litellm = "==1.81.4"
 homeassistant = "==2026.9.0"
 openai = ">=2.8.0"
+tqdm = "==4.67.1"
 
 [dev-packages]
 pytest = "*"
