@@ -4,7 +4,7 @@
   "after_dependencies": ["assist_pipeline", "intent"],
   "codeowners": ["@michelle-avery"],
   "config_flow": true,
-  "dependencies": ["conversation"],
+  "dependencies": ["conversation", "llm"],
   "documentation": "https://github.com/michelle-avery/custom-conversation",
   "issue_tracker": "https://github.com/michelle-avery/custom-conversation/issues",
   "integration_type": "service",

@@ -38,7 +38,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.json import ExtendedJSONEncoder
 
 from . import CustomConversationConfigEntry
-from .api import IntentTool
 from .cc_llm import async_update_llm_data
 from .const import (
     CONF_AGENTS_SECTION,
@@ -175,7 +174,7 @@ async def async_setup_entry(
 
 
 def _format_tool(
-    tool: IntentTool, custom_serializer: Callable[[Any], Any] | None
+    tool: llm.Tool, custom_serializer: Callable[[Any], Any] | None
 ) -> ChatCompletionToolParam:
     """Format tool specification."""
     tool_spec = {

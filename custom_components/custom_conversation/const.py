@@ -103,6 +103,12 @@ DEFAULT_API_PROMPT_EXPOSED_ENTITIES = (
     "An overview of the areas and the devices in this smart home:"
 )
 
+CONF_PROMPT_LIVE_CONTEXT = "prompt_live_context"
+DEFAULT_API_PROMPT_LIVE_CONTEXT = (
+    "Use GetLiveContext for questions about the current state, value, or mode "
+    "of devices and sensors. You MUST call it when the answer requires live data."
+)
+
 # Langfuse Constants
 CONF_LANGFUSE_SECTION = "langfuse"
 CONF_ENABLE_LANGFUSE = "enable_langfuse"

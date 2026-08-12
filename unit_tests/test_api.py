@@ -7,10 +7,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import voluptuous as vol
 
 from custom_components.custom_conversation.api import (
+    CardPreservingIntentTool,
     CustomLLMAPI,
-    GetLiveContextTool,
-    IntentTool,
-    _get_exposed_entities,
+    FilteredDateTimeTool,
 )
 from custom_components.custom_conversation.const import (
     CONF_IGNORED_INTENTS,
@@ -21,13 +20,11 @@ from custom_components.custom_conversation.prompt_manager import (
     PromptContext,
     PromptManager,
 )
+from homeassistant.components import llm as llm_component
+from homeassistant.components.script.llm import ScriptTool
 from homeassistant.core import Context
-from homeassistant.helpers import (
-    device_registry as dr,
-    entity_registry as er,
-    intent,
-    llm,
-)
+from homeassistant.helpers import device_registry as dr, intent, llm
+from homeassistant.setup import async_setup_component
 
 
 @pytest.fixture
@@ -71,56 +68,6 @@ def mock_assist_device(device_registry, mock_area, hass):
     return device
 
 @pytest.fixture
-def mock_target_device(device_registry, mock_area, hass):
-    """Fixture for a mocked light."""
-    config_entry = MockConfigEntry(domain="light")
-    config_entry.add_to_hass(hass)
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get_or_create(config_entry_id=config_entry.entry_id, identifiers={("light", "test_light")}, name="Test Light")
-    device_registry.async_update_device(device_id=device.id, area_id=mock_area.id)
-    return device
-
-@pytest.fixture
-def mock_target_entity(entity_registry, mock_target_device, hass):
-    """Fixture for a mocked light entity."""
-    entity_registry = er.async_get(hass)
-    entity = entity_registry.async_get_or_create(
-        domain="light",
-        platform="test_platform",
-        unique_id="test_light_unique_id",
-        device_id=mock_target_device.id,
-    )
-    hass.states.async_set(
-        entity.entity_id,
-        "on",
-        {
-            "brightness": 100,
-            "device_class": "light",
-            "friendly_name": "Test Light",
-        }
-    )
-    return entity
-
-@pytest.fixture
-def mock_script(entity_registry, hass):
-    """Fixture for a mocked script entity."""
-    entity_registry = er.async_get(hass)
-    entity = entity_registry.async_get_or_create(
-        domain="script",
-        platform="test_platform",
-        unique_id="my_script",
-    )
-    hass.states.async_set(
-        entity.entity_id,
-        "unknown",
-        {
-            "friendly_name": "My Script",
-        }
-    )
-    return entity
-
-
-@pytest.fixture
 def mock_llm_context(mock_assist_device) -> MagicMock:
     """Fixture for a mocked LLMContext."""
     context = MagicMock(spec=llm.LLMContext)
@@ -156,10 +103,13 @@ async def test_custom_llm_api_get_api_instance(custom_llm_api, mock_llm_context,
     """Test getting an API instance."""
     mock_api_prompt = "Test API Prompt"
     mock_tools = [MagicMock(spec=llm.Tool)]
+    platform_tools = llm_component.LLMTools(
+        tools=mock_tools, prompt="Platform prompt"
+    )
 
     with patch("custom_components.custom_conversation.api._get_exposed_entities", return_value=mock_exposed_entities_data) as mock_get_exposed, \
          patch.object(custom_llm_api, "_async_get_api_prompt", return_value=mock_api_prompt) as mock_get_prompt, \
-         patch.object(custom_llm_api, "_async_get_tools", return_value=mock_tools) as mock_get_tools, \
+         patch.object(custom_llm_api, "_async_get_tools", new_callable=AsyncMock, return_value=platform_tools) as mock_get_tools, \
          patch("homeassistant.helpers.llm.APIInstance") as mock_api_instance_cls, \
          patch("homeassistant.helpers.llm.selector_serializer") as mock_serializer:
 
@@ -169,7 +119,7 @@ async def test_custom_llm_api_get_api_instance(custom_llm_api, mock_llm_context,
             custom_llm_api.hass, mock_llm_context.assistant, include_state=False
         )
         mock_get_prompt.assert_called_once_with(mock_llm_context, mock_exposed_entities_data)
-        mock_get_tools.assert_called_once_with(mock_llm_context, mock_exposed_entities_data)
+        mock_get_tools.assert_awaited_once_with(mock_llm_context)
         mock_api_instance_cls.assert_called_once_with(
             api=custom_llm_api,
             api_prompt=mock_api_prompt,
@@ -198,7 +148,14 @@ async def test_custom_llm_api_normalizes_langfuse_prompt(
             new_callable=AsyncMock,
             return_value=(prompt_object, "Compiled prompt"),
         ),
-        patch.object(custom_llm_api, "_async_get_tools", return_value=[]),
+        patch.object(
+            custom_llm_api,
+            "_async_get_tools",
+            new_callable=AsyncMock,
+            return_value=llm_component.LLMTools(
+                tools=[], prompt="Platform prompt"
+            ),
+        ),
     ):
         instance = await custom_llm_api.async_get_api_instance(mock_llm_context)
 
@@ -236,386 +193,146 @@ async def test_custom_llm_api_get_api_prompt(custom_llm_api, hass, mock_llm_cont
         assert prompt == expected_prompt
 
 @pytest.mark.asyncio
-async def test_custom_llm_api_get_tools(custom_llm_api, hass, mock_llm_context, config_entry, mock_exposed_entities_data):
-    """Test generating the list of tools."""
-    mock_intent_handler_1 = MagicMock(spec=intent.IntentHandler, intent_type="HassTurnOn", description="Turn something on", slot_schema={"name": {"type": "string"}}, platforms={"light"})
-    mock_intent_handler_2 = MagicMock(spec=intent.IntentHandler, intent_type="HassTurnOff", description="Turn something off", slot_schema=None, platforms=None)
-    mock_intent_handler_timer = MagicMock(spec=intent.IntentHandler, intent_type=intent.INTENT_START_TIMER, description="Start timer", slot_schema=None)
-
-    mock_intent_handlers = [mock_intent_handler_1, mock_intent_handler_2, mock_intent_handler_timer]
-    mock_exposed_entities = mock_exposed_entities_data
-
+async def test_custom_llm_api_get_tools(
+    custom_llm_api, hass, mock_llm_context, config_entry
+):
+    """Test Assist platform discovery and ignored-intent filtering."""
     hass.config_entries.async_update_entry(
         config_entry,
-        options={CONF_IGNORED_INTENTS_SECTION: {CONF_IGNORED_INTENTS: ["HassTurnOff"]}},
+        options={
+            CONF_IGNORED_INTENTS_SECTION: {
+                CONF_IGNORED_INTENTS: ["HassTurnOff", "My Intent"]
+            }
+        },
     )
     await hass.async_block_till_done()
 
-    with patch("custom_components.custom_conversation.api.intent.async_get", return_value=mock_intent_handlers) as mock_intent_get, \
-         patch("custom_components.custom_conversation.api.async_device_supports_timers", return_value=False) as mock_supports_timers, \
-         patch("custom_components.custom_conversation.api.IntentTool") as mock_intent_tool_cls:
-
-        tools = custom_llm_api._async_get_tools(mock_llm_context, mock_exposed_entities)
-
-        mock_intent_get.assert_called_once_with(hass)
-        mock_supports_timers.assert_called_once_with(hass, mock_llm_context.device_id)
-
-        mock_intent_tool_cls.assert_called_once_with("HassTurnOn", mock_intent_handler_1)
-        assert len(tools) == 2
-        assert tools[0] is mock_intent_tool_cls.return_value
-        assert isinstance(tools[1], GetLiveContextTool)
-
-
-@pytest.mark.asyncio
-async def test_custom_llm_api_get_tools_no_exposed_entities(custom_llm_api, hass, mock_llm_context, config_entry):
-    """Test that GetLiveContextTool is omitted when nothing is exposed."""
-    with patch("custom_components.custom_conversation.api.intent.async_get", return_value=[]), \
-         patch("custom_components.custom_conversation.api.async_device_supports_timers", return_value=False):
-
-        tools = custom_llm_api._async_get_tools(mock_llm_context, {})
-
-        assert not any(isinstance(tool, GetLiveContextTool) for tool in tools)
-
-
-def test_intent_tool_init():
-    """Test IntentTool initialization."""
-    mock_handler = MagicMock(
-        spec=intent.IntentHandler,
-        intent_type="MyIntent",
-        description="Does my intent",
-        slot_schema={
-            "name": {"type": "string", "required": True},
-            "area": {"type": "string"},
-            "preferred_area_id": {"type": "string"},
-        }
-    )
-
-    tool = IntentTool("myintent", mock_handler)
-
-    assert tool.name == "myintent"
-    assert tool.description == "Does my intent"
-    assert isinstance(tool.parameters, vol.Schema)
-    assert "preferred_area_id" not in tool.parameters.schema
-    assert "name" in tool.parameters.schema
-    assert "area" in tool.parameters.schema
-    assert tool.extra_slots == {"preferred_area_id"}
-
-def test_intent_tool_init_no_schema():
-    """Test IntentTool initialization with no slot schema."""
-    mock_handler = MagicMock(
-        spec=intent.IntentHandler,
-        intent_type="SimpleIntent",
-        description=None,
-        slot_schema=None
-    )
-    tool = IntentTool("simpleintent", mock_handler)
-
-    assert tool.name == "simpleintent"
-    assert tool.description == "Execute Home Assistant simpleintent intent"
-    assert tool.extra_slots is None
-
-@pytest.mark.asyncio
-async def test_intent_tool_async_call(hass, mock_llm_context, mock_target_device, mock_target_entity):
-    """Test calling the IntentTool."""
-    mock_handler = MagicMock(
-        spec=intent.IntentHandler,
-        intent_type="HassTurnOn",
-        description="Turn on",
-        slot_schema={
-            "name": {"type": "string"},
-            "area": {"type": "string"},
-            "preferred_area_id": {"type": "string"},
-        }
-    )
-    tool_input = llm.ToolInput(tool_name="HassTurnOn", tool_args={"name": "kitchen light", "area": "Test Area"})
-    mock_intent_response = MagicMock(spec=intent.IntentResponse)
-    mock_intent_response.as_dict.return_value = {"speech": {"plain": {"speech": "Turned on kitchen light"}}, "language": "en"}
-
-
-    with patch("homeassistant.helpers.intent.async_handle", return_value=mock_intent_response) as mock_async_handle:
-
-        tool = IntentTool("HassTurnOn", mock_handler)
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
-
-        expected_slots = {
-            "name": {"value": "kitchen light"},
-            "area": {"value": "Test Area"},
-            "preferred_area_id": {"value": "test_area"},
-        }
-
-        mock_async_handle.assert_called_once_with(
-            hass=hass,
-            platform=mock_llm_context.platform,
-            intent_type="HassTurnOn",
-            slots=expected_slots,
-            text_input=None,
-            context=mock_llm_context.context,
-            language=mock_llm_context.language,
-            assistant=mock_llm_context.assistant,
-            device_id=mock_llm_context.device_id,
-        )
-
-        assert response == {"speech": {"plain": {"speech": "Turned on kitchen light"}}}
-
-
-
-@patch("custom_components.custom_conversation.api._get_cached_script_parameters")
-@patch("custom_components.custom_conversation.api.async_should_expose", return_value=True)
-@patch("homeassistant.core.StateMachine.async_all")
-def test_get_exposed_entities_with_area(mock_async_all, mock_should_expose, mock_get_script_params, hass, mock_area, mock_target_entity):
-    """Test _get_exposed_entities for an entity with a direct area."""
-    entity_registry = er.async_get(hass)
-    entity_registry.async_update_entity(mock_target_entity.entity_id, area_id=mock_area.id)
-    entity_id = mock_target_entity.entity_id
-    mock_async_all.return_value = [hass.states.get(entity_id)]
-
-    assistant_id = "conversation.test_assistant"
-    entities = _get_exposed_entities(hass, assistant_id)
-
-    mock_async_all.assert_called_once()
-    mock_should_expose.assert_called_once_with(hass, assistant_id, entity_id)
-
-    assert len(entities) == 1
-    assert entity_id in entities
-    light_info = entities[entity_id]
-    assert light_info["names"] == "Test Light"
-    assert light_info["domain"] == "light"
-    assert light_info["state"] == "on"
-    assert light_info["areas"] == "Test Area"
-    assert light_info["attributes"] == {"brightness": "100", "device_class": "light"}
-    assert "description" not in light_info
-    mock_get_script_params.assert_not_called()
-
-
-@patch("custom_components.custom_conversation.api._get_cached_script_parameters")
-@patch("custom_components.custom_conversation.api.async_should_expose", return_value=True)
-@patch("homeassistant.core.StateMachine.async_all")
-def test_get_exposed_entities_with_device_area(mock_async_all, mock_should_expose, mock_get_script_params, hass, mock_target_entity):
-    """Test _get_exposed_entities for an entity using device area fallback."""
-    entity_id = mock_target_entity.entity_id
-    mock_async_all.return_value = [hass.states.get(entity_id)]
-
-    assistant_id = "conversation.test_assistant"
-    entities = _get_exposed_entities(hass, assistant_id)
-
-    mock_async_all.assert_called_once()
-    mock_should_expose.assert_called_once_with(hass, assistant_id, entity_id)
-
-    assert len(entities) == 1
-    assert entity_id in entities
-    light_info = entities[entity_id]
-    assert light_info["names"] == "Test Light"
-    assert light_info["domain"] == "light"
-    assert light_info["state"] == "on"
-    assert light_info["areas"] == "Test Area"
-    assert light_info["attributes"] == {"brightness": "100", "device_class": "light"}
-    assert "description" not in light_info
-    mock_get_script_params.assert_not_called()
-
-
-@patch("custom_components.custom_conversation.api._get_cached_script_parameters", return_value=("Script Desc", vol.Schema({})))
-@patch("custom_components.custom_conversation.api.async_should_expose", return_value=True)
-@patch("homeassistant.core.StateMachine.async_all")
-def test_get_exposed_entities_script(mock_async_all, mock_should_expose, mock_get_script_params, hass, mock_script):
-    """Test _get_exposed_entities for a script entity."""
-
-    mock_async_all.return_value = [hass.states.get(mock_script.entity_id)]
-
-    assistant_id = "conversation.test_assistant"
-    entities = _get_exposed_entities(hass, assistant_id)
-
-    mock_async_all.assert_called_once()
-    mock_should_expose.assert_called_once_with(hass, assistant_id, "script.test_platform_my_script")
-    mock_get_script_params.assert_called_once_with(hass, "script.test_platform_my_script")
-
-    assert len(entities) == 1
-    assert "script.test_platform_my_script" in entities
-    script_info = entities["script.test_platform_my_script"]
-    assert script_info["names"] == "My Script"
-    assert script_info["domain"] == "script"
-    assert script_info["state"] == "unknown"
-    assert script_info["description"] == "Script Desc"
-    assert "areas" not in script_info
-    assert "attributes" not in script_info
-
-
-@patch("custom_components.custom_conversation.api._get_cached_script_parameters")
-@patch("custom_components.custom_conversation.api.async_should_expose", return_value=False)
-@patch("homeassistant.core.StateMachine.async_all")
-def test_get_exposed_entities_unexposed(mock_async_all, mock_should_expose, mock_get_script_params, hass, mock_target_entity):
-    """Test _get_exposed_entities for an entity that should not be exposed."""
-
-    mock_async_all.return_value = [hass.states.get(mock_target_entity.entity_id)]
-
-    assistant_id = "conversation.test_assistant"
-    entities = _get_exposed_entities(hass, assistant_id)
-
-    mock_async_all.assert_called_once()
-    mock_should_expose.assert_called_once_with(hass, assistant_id, mock_target_entity.entity_id)
-    mock_get_script_params.assert_not_called()
-
-    assert len(entities) == 0
-    assert mock_target_entity.entity_id not in entities
-
-
-@patch("custom_components.custom_conversation.api._get_cached_script_parameters")
-@patch("custom_components.custom_conversation.api.async_should_expose", return_value=True)
-@patch("homeassistant.core.StateMachine.async_all")
-def test_get_exposed_entities_include_state_false(mock_async_all, mock_should_expose, mock_get_script_params, hass, mock_target_entity):
-    """Test _get_exposed_entities omits state and attributes when include_state is False."""
-    mock_async_all.return_value = [hass.states.get(mock_target_entity.entity_id)]
-
-    assistant_id = "conversation.test_assistant"
-    entities = _get_exposed_entities(hass, assistant_id, include_state=False)
-
-    light_info = entities[mock_target_entity.entity_id]
-    assert light_info["names"] == "Test Light"
-    assert light_info["domain"] == "light"
-    assert light_info["areas"] == "Test Area"
-    assert "state" not in light_info
-    assert "attributes" not in light_info
-
-
-@pytest.mark.asyncio
-async def test_get_live_context_tool_no_filter(hass, mock_llm_context, mock_target_entity):
-    """Test GetLiveContextTool returns all exposed entities when no filter is given."""
-    tool_input = llm.ToolInput(tool_name="GetLiveContext", tool_args={})
-    mock_entities = {
-        mock_target_entity.entity_id: {
-            "names": "Test Light",
-            "domain": "light",
-            "state": "on",
-            "attributes": {"brightness": "100"},
-        }
-    }
+    handler = MagicMock(spec=intent.IntentHandler, description=None, slot_schema=None)
+    non_intent_tool = MagicMock(spec=llm.Tool)
+    non_intent_tool.name = "GetDateTime"
+    tools_from_platforms = [
+        llm.IntentTool("HassTurnOn", handler),
+        llm.IntentTool("HassTurnOff", handler),
+        llm.IntentTool("My_Intent", handler),
+        non_intent_tool,
+    ]
 
     with patch(
-        "custom_components.custom_conversation.api._get_exposed_entities",
-        return_value=mock_entities,
-    ) as mock_get_exposed:
-        tool = GetLiveContextTool()
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
+        "custom_components.custom_conversation.api.llm_component.async_get_tools",
+        new_callable=AsyncMock,
+        return_value=llm_component.LLMTools(tools=tools_from_platforms),
+    ) as mock_get_tools:
+        tools = await custom_llm_api._async_get_tools(mock_llm_context)
 
-        mock_get_exposed.assert_called_once_with(
-            hass, mock_llm_context.assistant, include_state=True
-        )
-        assert response["success"] is True
-        assert "Test Light" in response["result"]
+    mock_get_tools.assert_awaited_once_with(
+        hass, mock_llm_context, llm.LLM_API_ASSIST
+    )
+    assert [tool.name for tool in tools.tools] == ["HassTurnOn", "GetDateTime"]
+    assert isinstance(tools.tools[0], CardPreservingIntentTool)
 
 
 @pytest.mark.asyncio
-async def test_get_live_context_tool_no_exposed_entities(hass, mock_llm_context):
-    """Test GetLiveContextTool when nothing is exposed."""
-    tool_input = llm.ToolInput(tool_name="GetLiveContext", tool_args={})
-
-    with patch(
-        "custom_components.custom_conversation.api._get_exposed_entities",
-        return_value={},
-    ):
-        tool = GetLiveContextTool()
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
-
-        assert response == {"success": False, "error": "No entities are exposed"}
-
-
-@pytest.mark.asyncio
-async def test_get_live_context_tool_filter_no_match(hass, mock_llm_context, mock_target_entity):
-    """Test GetLiveContextTool returns an error when the name filter matches nothing."""
-    tool_input = llm.ToolInput(
-        tool_name="GetLiveContext", tool_args={"name": "Nonexistent Entity"}
-    )
-    mock_entities = {
-        mock_target_entity.entity_id: {
-            "names": "Test Light",
-            "domain": "light",
-            "state": "on",
-        }
-    }
-
-    with patch(
-        "custom_components.custom_conversation.api._get_exposed_entities",
-        return_value=mock_entities,
-    ):
-        tool = GetLiveContextTool()
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
-
-        assert response["success"] is False
-        assert "Nonexistent Entity" in response["error"]
-
-
-@pytest.mark.asyncio
-async def test_get_live_context_tool_domain_filter_match(hass, mock_llm_context, mock_target_entity):
-    """Test GetLiveContextTool with a string domain filter returns the matched subset."""
-    tool_input = llm.ToolInput(tool_name="GetLiveContext", tool_args={"domain": "light"})
-    mock_entities = {
-        mock_target_entity.entity_id: {"names": "Test Light", "domain": "light", "state": "on"},
-        "sensor.other": {"names": "Other", "domain": "sensor", "state": "5"},
-    }
-    mock_match_result = MagicMock(
-        is_match=True,
-        states=[MagicMock(entity_id=mock_target_entity.entity_id)],
-    )
-
-    with patch(
-        "custom_components.custom_conversation.api._get_exposed_entities",
-        return_value=mock_entities,
-    ), patch(
-        "custom_components.custom_conversation.api.intent.async_match_targets",
-        return_value=mock_match_result,
-    ) as mock_match:
-        tool = GetLiveContextTool()
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
-
-        assert mock_match.call_args.args[1].domains == ["light"]
-        assert response["success"] is True
-        assert "Test Light" in response["result"]
-        assert "Other" not in response["result"]
-
-
-@pytest.mark.asyncio
-async def test_get_live_context_tool_domain_filter_list_strips_blanks(hass, mock_llm_context, mock_target_entity):
-    """Test GetLiveContextTool normalizes a list domain filter, dropping blank entries."""
-    tool_input = llm.ToolInput(
-        tool_name="GetLiveContext", tool_args={"domain": ["Light", "  ", "Sensor"]}
-    )
-    mock_entities = {
-        mock_target_entity.entity_id: {"names": "Test Light", "domain": "light", "state": "on"},
-    }
-    mock_match_result = MagicMock(
-        is_match=True,
-        states=[MagicMock(entity_id=mock_target_entity.entity_id)],
-    )
-
-    with patch(
-        "custom_components.custom_conversation.api._get_exposed_entities",
-        return_value=mock_entities,
-    ), patch(
-        "custom_components.custom_conversation.api.intent.async_match_targets",
-        return_value=mock_match_result,
-    ) as mock_match:
-        tool = GetLiveContextTool()
-        response = await tool.async_call(hass, tool_input, mock_llm_context)
-
-        assert mock_match.call_args.args[1].domains == ["light", "sensor"]
-        assert response["success"] is True
-
-
 @pytest.mark.parametrize(
-    ("reason", "expected_substring"),
+    ("ignored", "expected_fields"),
     [
-        (intent.MatchFailedReason.INVALID_AREA, "does not exist"),
-        (intent.MatchFailedReason.NAME, "matched name"),
-        (intent.MatchFailedReason.AREA, "found in area"),
-        (intent.MatchFailedReason.DOMAIN, "found in domain"),
-        (intent.MatchFailedReason.ASSISTANT, "No entities matched the provided filter"),
+        (["HassGetCurrentDate"], {"time", "timezone"}),
+        (["HassGetCurrentTime"], {"date", "weekday"}),
     ],
 )
-def test_live_context_match_error_reasons(reason, expected_substring):
-    """Test _live_context_match_error covers every branch, including the generic fallback."""
-    from custom_components.custom_conversation.api import _live_context_match_error
-
-    match_result = MagicMock(no_match_reason=reason, no_match_name="Kitchen")
-    message = _live_context_match_error(
-        match_result, name_filter="Foo", area_filter="Kitchen", domain_filter=["light"]
+async def test_filtered_date_time_tool(
+    custom_llm_api, mock_llm_context, config_entry, ignored, expected_fields
+):
+    """Test independent legacy date/time settings filter the combined tool."""
+    custom_llm_api.hass.config_entries.async_update_entry(
+        config_entry,
+        options={
+            CONF_IGNORED_INTENTS_SECTION: {
+                CONF_IGNORED_INTENTS: ignored,
+            }
+        },
     )
-    assert expected_substring in message
+    combined_tool = MagicMock(spec=llm.Tool)
+    combined_tool.name = "GetDateTime"
+    combined_tool.description = "Provides the current date and time."
+    combined_tool.parameters = vol.Schema({})
+    combined_tool.async_call = AsyncMock(
+        return_value={
+            "success": True,
+            "result": {
+                "date": "2026-08-12",
+                "weekday": "Wednesday",
+                "time": "12:34:56",
+                "timezone": "UTC",
+            },
+        }
+    )
+    with patch(
+        "custom_components.custom_conversation.api.llm_component.async_get_tools",
+        new_callable=AsyncMock,
+        return_value=llm_component.LLMTools(tools=[combined_tool]),
+    ):
+        llm_tools = await custom_llm_api._async_get_tools(mock_llm_context)
+
+    tool = llm_tools.tools[0]
+    assert isinstance(tool, FilteredDateTimeTool)
+    result = await tool.async_call(
+        custom_llm_api.hass,
+        llm.ToolInput(tool_name=tool.name, tool_args={}),
+        mock_llm_context,
+    )
+    assert set(result["result"]) == expected_fields
+
+
+@pytest.mark.asyncio
+async def test_card_preserving_intent_tool(hass, mock_llm_context):
+    """Test cards removed by HA's serializer remain available to event consumers."""
+    response = intent.IntentResponse(language="en")
+    response.async_set_card("Title", "Content")
+    serialized = llm.IntentResponseDict(response)
+    delegated_tool = MagicMock(spec=llm.IntentTool)
+    delegated_tool.name = "CardIntent"
+    delegated_tool.description = "Return a card"
+    delegated_tool.parameters = vol.Schema({})
+    delegated_tool.async_call = AsyncMock(return_value=serialized)
+    tool = CardPreservingIntentTool(delegated_tool)
+
+    result = await tool.async_call(
+        hass,
+        llm.ToolInput(tool_name=tool.name, tool_args={}),
+        mock_llm_context,
+    )
+
+    assert result["card"] == {
+        "simple": {"title": "Title", "content": "Content"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_custom_llm_api_discovers_exposed_script(
+    custom_llm_api, hass, mock_llm_context
+):
+    """Test exposed scripts are discovered through the HA 2026.8 platform API."""
+    assert await async_setup_component(
+        hass,
+        "script",
+        {"script": {"test_script": {"sequence": []}}},
+    )
+    await hass.async_block_till_done()
+
+    with patch(
+        "homeassistant.components.script.llm.async_should_expose",
+        return_value=True,
+    ):
+        llm_tools = await custom_llm_api._async_get_tools(mock_llm_context)
+
+    tools = llm_tools.tools
+    tool_names = {tool.name for tool in tools}
+    assert {"GetLiveContext", "test_script"} <= tool_names
+    assert "GetDateTime" not in tool_names
+    script_tool = next(tool for tool in tools if isinstance(tool, ScriptTool))
+    result = await script_tool.async_call(
+        hass,
+        llm.ToolInput(tool_name=script_tool.name, tool_args={}),
+        mock_llm_context,
+    )
+    assert result["success"] is True

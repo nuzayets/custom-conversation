@@ -53,6 +53,7 @@ from .const import (
     CONF_PROMPT_DEVICE_KNOWN_LOCATION,
     CONF_PROMPT_DEVICE_UNKNOWN_LOCATION,
     CONF_PROMPT_EXPOSED_ENTITIES,
+    CONF_PROMPT_LIVE_CONTEXT,
     CONF_PROMPT_NO_ENABLED_ENTITIES,
     CONF_PROMPT_TIMERS_UNSUPPORTED,
     CONF_SECONDARY_API_KEY,
@@ -68,6 +69,7 @@ from .const import (
     DEFAULT_API_PROMPT_DEVICE_KNOWN_LOCATION,
     DEFAULT_API_PROMPT_DEVICE_UNKNOWN_LOCATION,
     DEFAULT_API_PROMPT_EXPOSED_ENTITIES,
+    DEFAULT_API_PROMPT_LIVE_CONTEXT,
     DEFAULT_API_PROMPT_TIMERS_UNSUPPORTED,
     DEFAULT_BASE_PROMPT,
     DEFAULT_IGNORED_INTENTS,
@@ -98,6 +100,7 @@ DEFAULT_OPTIONS = {
         CONF_PROMPT_DEVICE_UNKNOWN_LOCATION: DEFAULT_API_PROMPT_DEVICE_UNKNOWN_LOCATION,
         CONF_PROMPT_TIMERS_UNSUPPORTED: DEFAULT_API_PROMPT_TIMERS_UNSUPPORTED,
         CONF_PROMPT_EXPOSED_ENTITIES: DEFAULT_API_PROMPT_EXPOSED_ENTITIES,
+        CONF_PROMPT_LIVE_CONTEXT: DEFAULT_API_PROMPT_LIVE_CONTEXT,
     },
     CONF_LANGFUSE_SECTION: {
         CONF_ENABLE_LANGFUSE: False,
@@ -665,6 +668,15 @@ class CustomConversationOptionsFlow(OptionsFlow):
                                 ).get(
                                     CONF_PROMPT_TIMERS_UNSUPPORTED,
                                     DEFAULT_API_PROMPT_TIMERS_UNSUPPORTED,
+                                ),
+                            ): TextSelector(TextSelectorConfig(multiline=True)),
+                            vol.Optional(
+                                CONF_PROMPT_LIVE_CONTEXT,
+                                default=options.get(
+                                    CONF_CUSTOM_PROMPTS_SECTION, {}
+                                ).get(
+                                    CONF_PROMPT_LIVE_CONTEXT,
+                                    DEFAULT_API_PROMPT_LIVE_CONTEXT,
                                 ),
                             ): TextSelector(TextSelectorConfig(multiline=True)),
                             vol.Optional(
