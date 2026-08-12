@@ -385,6 +385,45 @@ async def test_router_is_built_once_for_concurrent_requests(hass):
     build_router.assert_called_once_with(entity.entry)
 
 
+async def test_router_build_preloads_cost_calculator(hass):
+    """Test Router construction resolves completion-time lazy imports."""
+    accesses: list[str] = []
+
+    class LazyImports:
+        @property
+        def completion_cost(self) -> None:
+            accesses.append("completion_cost")
+
+        @property
+        def cost_per_token(self) -> None:
+            accesses.append("cost_per_token")
+
+        @property
+        def response_cost_calculator(self) -> None:
+            accesses.append("response_cost_calculator")
+
+    entity = CustomConversationEntity(_entry(), Mock(), hass)
+    router = Mock()
+    with (
+        patch(
+            "custom_components.custom_conversation.conversation.Router",
+            return_value=router,
+        ),
+        patch(
+            "custom_components.custom_conversation.conversation.litellm",
+            new=LazyImports(),
+        ),
+    ):
+        result = await entity._async_get_router(entity.entry)
+
+    assert result is router
+    assert accesses == [
+        "completion_cost",
+        "cost_per_token",
+        "response_cost_calculator",
+    ]
+
+
 async def test_fallback_tags_only_successful_agent(hass, config_entry):
     """Test HASS-to-LLM fallback does not claim HASS handled the request."""
     assert await async_setup_component(hass, "custom_conversation", {})

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Literal, Union, cast
 
 if TYPE_CHECKING:
     from langfuse.model import PromptClient
+import litellm
 from litellm import OpenAIError, RateLimitError, Router
 from litellm.types.completion import (
     ChatCompletionAssistantMessageParam,
@@ -874,6 +875,13 @@ class CustomConversationEntity(
 
     @staticmethod
     def _build_router(entry: CustomConversationConfigEntry) -> Router:
+        # LiteLLM resolves these lazily on the first completion.
+        _ = (
+            litellm.completion_cost,
+            litellm.cost_per_token,
+            litellm.response_cost_calculator,
+        )
+
         primary_model = f"{entry.data.get(CONF_PRIMARY_PROVIDER)}/{entry.data.get(CONF_PRIMARY_CHAT_MODEL)}"
         model_list: list[dict[str, Any]] = [
             {
