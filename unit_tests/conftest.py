@@ -25,7 +25,7 @@ from homeassistant.setup import async_setup_component
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Enable custom integrations for testing."""
-    yield
+    return
 
 @pytest.fixture(autouse=True)
 async def mock_default_components(hass: HomeAssistant) -> None:
@@ -36,11 +36,11 @@ async def mock_default_components(hass: HomeAssistant) -> None:
 @pytest.fixture
 def hass(hass: HomeAssistant) -> HomeAssistant:
     """Fixture that provides a fully set up Home Assistant instance."""
-    hass.data.update({DOMAIN: {}})    
+    hass.data.update({DOMAIN: {}})
     return hass
 
 @pytest.fixture
-def config_entry(hass: HomeAssistant) -> MockConfigEntry:
+async def config_entry(hass: HomeAssistant) -> MockConfigEntry:
     """Create a mock config entry."""
     entry = MockConfigEntry(
         title="Test",
@@ -64,7 +64,7 @@ def config_entry(hass: HomeAssistant) -> MockConfigEntry:
         }
     )
     entry.add_to_hass(hass)
-    hass.config_entries.async_setup(entry.entry_id)
-    hass.async_block_till_done()
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
     return entry
 

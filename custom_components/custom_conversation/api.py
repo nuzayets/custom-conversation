@@ -34,9 +34,9 @@ from homeassistant.helpers import (
     selector,
     service,
 )
+from homeassistant.util import yaml as yaml_util
 from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.json import JsonObjectType
-from homeassistant.util import yaml as yaml_util
 
 from .const import (
     CONF_IGNORED_INTENTS,
@@ -82,16 +82,21 @@ class CustomLLMAPI(llm.API):
         else:
             exposed_entities = None
 
+        api_prompt = await self._async_get_api_prompt(llm_context, exposed_entities)
+        if isinstance(api_prompt, tuple):
+            self.prompt_object, api_prompt = api_prompt
+        else:
+            self.prompt_object = None
+
         return llm.APIInstance(
             api=self,
-            api_prompt=self._async_get_api_prompt(llm_context, exposed_entities),
+            api_prompt=api_prompt,
             llm_context=llm_context,
             tools=self._async_get_tools(llm_context, exposed_entities),
             custom_serializer=llm.selector_serializer,
         )
 
-    @callback
-    def _async_get_api_prompt(
+    async def _async_get_api_prompt(
         self, llm_context: llm.LLMContext, exposed_entities: dict | None
     ) -> tuple[Prompt, str] | str:
         """Return the prompt for the API."""
@@ -131,7 +136,7 @@ class CustomLLMAPI(llm.API):
             supports_timers=supports_timers,
         )
 
-        return self._prompt_manager.get_api_prompt(
+        return await self._prompt_manager.get_api_prompt(
             context, self.conversation_config_entry
         )
 

@@ -30,6 +30,18 @@ CONF_AGENTS_SECTION = "agents"
 CONF_LLM_PARAMETERS_SECTION = "llm_parameters"
 CONF_IGNORED_INTENTS_SECTION = "ignored_intents_section"
 CONF_IGNORED_INTENTS = "ignored_intents"
+DEFAULT_IGNORED_INTENTS = {
+    "HassCloseCover",
+    "HassGetCurrentDate",
+    "HassGetCurrentTime",
+    "HassGetState",
+    "HassGetTemperature",
+    "HassGetWeather",
+    "HassNevermind",
+    "HassOpenCover",
+    "HassRespond",
+    "HassToggle",
+}
 
 CONF_MAX_TOKENS = "max_tokens"
 DEFAULT_MAX_TOKENS = 150
