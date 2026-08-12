@@ -10,7 +10,6 @@ import pytest
 
 from custom_components.custom_conversation.const import (
     CONF_API_PROMPT_BASE,
-    CONF_CUSTOM_PROMPTS_SECTION,
     CONF_ENABLE_LANGFUSE,
     CONF_LANGFUSE_API_PROMPT_ID,
     CONF_LANGFUSE_BASE_PROMPT_ID,
@@ -20,9 +19,7 @@ from custom_components.custom_conversation.const import (
     CONF_LANGFUSE_SECRET_KEY,
     CONF_LANGFUSE_SECTION,
     CONF_LANGFUSE_TRACING_ENABLED,
-    CONF_PROMPT_BASE,
     DEFAULT_API_PROMPT_BASE,
-    DEFAULT_BASE_PROMPT,
     DEFAULT_INSTRUCTIONS_PROMPT,
     DEFAULT_PROMPT_NO_ENABLED_ENTITIES,
     LANGFUSE_SCORE_NAME,
@@ -36,7 +33,6 @@ from custom_components.custom_conversation.prompt_manager import (
     PromptManager,
 )
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.helpers import entity_registry as er
 
 
 def _langfuse_config_entry(
@@ -77,9 +73,9 @@ async def test_get_base_prompt_default(prompt_manager, hass):
         ha_name="Test Home",
         user_name="Test User",
     )
-    
+
     prompt = await prompt_manager.async_get_base_prompt(context)
-    
+
     assert "Current time is" in prompt
     assert DEFAULT_INSTRUCTIONS_PROMPT.strip() in prompt
 
@@ -91,9 +87,9 @@ async def test_get_base_prompt_custom(prompt_manager, hass, config_entry):
         ha_name="Test Home",
         user_name="Test User",
     )
-    
+
     prompt = await prompt_manager.async_get_base_prompt(context, config_entry)
-    
+
     assert "Custom base prompt for Test Home" in prompt
     assert "Custom instructions for Test User" in prompt
 
@@ -105,9 +101,9 @@ async def test_get_api_prompt_no_entities(prompt_manager, hass):
         ha_name="Test Home",
         exposed_entities=None,
     )
-    
+
     prompt = await prompt_manager.get_api_prompt(context)
-    
+
     assert prompt == DEFAULT_PROMPT_NO_ENABLED_ENTITIES
 
 
@@ -119,11 +115,12 @@ async def test_get_api_prompt_with_location(prompt_manager, hass, config_entry):
         location="Living Room",
         exposed_entities={"light.test": {"name": "Test Light"}},
     )
-    
+
     prompt = await prompt_manager.get_api_prompt(context, config_entry)
-    
+
     assert "Custom API base prompt" in prompt
     assert "Custom location prompt for Living Room" in prompt
+    assert "Use GetLiveContext" in prompt
     assert "Test Light" in prompt
 
 
@@ -135,9 +132,9 @@ async def test_get_api_prompt_no_timers(prompt_manager, hass):
         exposed_entities={"light.test": {"name": "Test Light"}},
         supports_timers=False,
     )
-    
+
     prompt = await prompt_manager.get_api_prompt(context)
-    
+
     assert "This device is not able to start timers" in prompt
 
 
@@ -145,7 +142,7 @@ async def test_get_api_prompt_no_timers(prompt_manager, hass):
 def test_get_prompt_config_no_config_entry(prompt_manager):
     """Test getting prompt config with no config entry."""
     result = prompt_manager._get_prompt_config(None, "test_key", "default_value")
-    
+
     assert result == "default_value"
 
 

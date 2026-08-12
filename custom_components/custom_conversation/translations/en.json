@@ -99,6 +99,7 @@
               "prompt_device_known_location": "Device Known Location Prompt",
               "prompt_device_unknown_location": "Device Unknown Location Prompt",
               "prompt_timers_unsupported": "Timers Unsupported Prompt",
+              "prompt_live_context": "Live Context Prompt",
               "prompt_exposed_entities": "Exposed Entities Prompt"
             },
             "data_description": {
@@ -108,6 +109,7 @@
               "prompt_device_known_location": "The prompt the API uses when the request comes from a device with a known area.  The '{{ location }}' variable will be replaced with the devices area and potentially floor.",
               "prompt_device_unknown_location": "The prompt the API uses with the request comes from a device whose area is unknown.",
               "prompt_timers_unsupported": "The prompt the API includes if the request comes from a device that cannot set timers.",
+              "prompt_live_context": "The prompt explaining when the model must retrieve current entity state.",
               "prompt_exposed_entities": "The prompt the API includes prior to the list of exposed entities and areas."
             }
           },
