@@ -1,6 +1,6 @@
 """Unit tests for the Custom Conversation API module."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -178,6 +178,33 @@ async def test_custom_llm_api_get_api_instance(custom_llm_api, mock_llm_context,
             custom_serializer=mock_serializer,
         )
         assert instance is mock_api_instance_cls.return_value
+
+
+@pytest.mark.asyncio
+async def test_custom_llm_api_normalizes_langfuse_prompt(
+    custom_llm_api, mock_llm_context, mock_exposed_entities_data
+):
+    """Test Langfuse prompt metadata stays outside the HA API prompt field."""
+    prompt_object = MagicMock()
+
+    with (
+        patch(
+            "custom_components.custom_conversation.api._get_exposed_entities",
+            return_value=mock_exposed_entities_data,
+        ),
+        patch.object(
+            custom_llm_api,
+            "_async_get_api_prompt",
+            new_callable=AsyncMock,
+            return_value=(prompt_object, "Compiled prompt"),
+        ),
+        patch.object(custom_llm_api, "_async_get_tools", return_value=[]),
+    ):
+        instance = await custom_llm_api.async_get_api_instance(mock_llm_context)
+
+    assert instance.api_prompt == "Compiled prompt"
+    assert custom_llm_api.prompt_object is prompt_object
+
 
 @pytest.mark.asyncio
 async def test_custom_llm_api_get_api_prompt(custom_llm_api, hass, mock_llm_context, mock_prompt_manager, config_entry, mock_exposed_entities_data, device_registry, area_registry, floor_registry):

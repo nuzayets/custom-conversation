@@ -33,11 +33,16 @@ from homeassistant.helpers import (
     selector,
     service,
 )
+from homeassistant.util import yaml as yaml_util
 from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.json import JsonObjectType
-from homeassistant.util import yaml as yaml_util
 
-from .const import CONF_IGNORED_INTENTS, CONF_IGNORED_INTENTS_SECTION, LLM_API_ID
+from .const import (
+    CONF_IGNORED_INTENTS,
+    CONF_IGNORED_INTENTS_SECTION,
+    DEFAULT_IGNORED_INTENTS,
+    LLM_API_ID,
+)
 from .prompt_manager import PromptContext, PromptManager
 
 
@@ -76,16 +81,21 @@ class CustomLLMAPI(llm.API):
         else:
             exposed_entities = None
 
+        api_prompt = await self._async_get_api_prompt(llm_context, exposed_entities)
+        if isinstance(api_prompt, tuple):
+            self.prompt_object, api_prompt = api_prompt
+        else:
+            self.prompt_object = None
+
         return llm.APIInstance(
             api=self,
-            api_prompt=self._async_get_api_prompt(llm_context, exposed_entities),
+            api_prompt=api_prompt,
             llm_context=llm_context,
             tools=self._async_get_tools(llm_context, exposed_entities),
             custom_serializer=llm.selector_serializer,
         )
 
-    @callback
-    def _async_get_api_prompt(
+    async def _async_get_api_prompt(
         self, llm_context: llm.LLMContext, exposed_entities: dict | None
     ) -> tuple[Prompt, str] | str:
         """Return the prompt for the API."""
@@ -125,7 +135,7 @@ class CustomLLMAPI(llm.API):
             supports_timers=supports_timers,
         )
 
-        return self._prompt_manager.get_api_prompt(
+        return await self._prompt_manager.get_api_prompt(
             context, self.conversation_config_entry
         )
 
@@ -142,11 +152,11 @@ class CustomLLMAPI(llm.API):
             )
             ignore_intents = set(
                 ignored_intents_section.get(
-                    CONF_IGNORED_INTENTS, llm.AssistAPI.IGNORE_INTENTS
+                    CONF_IGNORED_INTENTS, DEFAULT_IGNORED_INTENTS
                 )
             )
         else:
-            ignore_intents = llm.AssistAPI.IGNORE_INTENTS
+            ignore_intents = DEFAULT_IGNORED_INTENTS
 
         if not llm_context.device_id or not async_device_supports_timers(
             self.hass, llm_context.device_id

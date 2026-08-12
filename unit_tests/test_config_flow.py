@@ -55,7 +55,6 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_LLM_HASS_API
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.helpers import llm
 
 
 async def test_config_flow_user_steps_openai(hass: HomeAssistant):

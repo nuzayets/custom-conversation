@@ -106,12 +106,10 @@ async def async_update_llm_data(
         if llm_api and isinstance(llm_api.api, CustomLLMAPI):
             # The LLM API is the CustomLLMAPI, so use its prompt. The prompt manager
             # will pull in the base prompt if langfuse is disabled.
-            prompt = await llm_api.api_prompt
-            # If langfuse is successfully used, we'll get back a tuple that contains a
-            # prompt object as well
-            if isinstance(prompt, tuple):
+            prompt = llm_api.api_prompt
+            prompt_object = llm_api.api.prompt_object
+            if prompt_object is not None:
                 LOGGER.debug("Retrieved Langfuse Prompt")
-                prompt_object, prompt = prompt
             LOGGER.debug("LLM API prompt: %s", prompt)
         elif not llm_api:
             # No API is enabled - just get the base prompt
