@@ -122,12 +122,6 @@ DEFAULT_IGNORED_INTENTS = [
     "HassToggle",
 ]
 
-# These intents are deprecated, but also in the DEFAULT_IGNORED_INTENTS list
-HASS_DEPRECATED_INTENTS = [
-    "HassOpenCover",
-    "HassCloseCover",
-]
-
 # Deprecated constants for migrations only
 CONF_CHAT_MODEL = "chat_model"
 CONF_BASE_URL = "base_url"
