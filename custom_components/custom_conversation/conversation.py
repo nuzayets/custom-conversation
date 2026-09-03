@@ -18,7 +18,7 @@ from litellm.types.completion import (
 )
 from litellm.types.llms.openai import ChatCompletionToolParam, Function
 from litellm.types.utils import StreamingChatCompletionChunk
-from voluptuous_openapi import convert
+from probatio import to_openapi
 
 from homeassistant.components import conversation
 from homeassistant.components.conversation.chat_log import (
@@ -174,7 +174,7 @@ def _format_tool(
     """Format tool specification."""
     tool_spec = {
         "name": tool.name,
-        "parameters": convert(tool.parameters, custom_serializer=custom_serializer),
+        "parameters": to_openapi(tool.parameters, custom_serializer=custom_serializer),
     }
     if tool.description:
         tool_spec["description"] = tool.description

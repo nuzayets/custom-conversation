@@ -1,8 +1,10 @@
 """Unit tests for the Custom Conversation component."""
+import json
 from unittest.mock import AsyncMock, Mock, patch
 
 from litellm import RateLimitError
 import pytest
+import voluptuous as vol
 
 from custom_components.custom_conversation import CustomConversationConfigEntry
 from custom_components.custom_conversation.const import (
@@ -12,12 +14,16 @@ from custom_components.custom_conversation.const import (
     CONVERSATION_ERROR_EVENT,
     LLM_API_ID,
 )
-from custom_components.custom_conversation.conversation import CustomConversationEntity
+from custom_components.custom_conversation.api import IntentTool
+from custom_components.custom_conversation.conversation import (
+    CustomConversationEntity,
+    _format_tool,
+)
 from homeassistant.components import conversation
 from homeassistant.const import CONF_LLM_HASS_API
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import intent
+from homeassistant.helpers import intent, llm
 from homeassistant.setup import async_setup_component
 
 
@@ -237,3 +243,20 @@ async def test_async_fire_conversation_error(hass: HomeAssistant, config_entry: 
     assert event_data["device_area"] == "Living Room"
     assert event_data["request"] == "Turn on the lights"
     assert event_data["error"] == "Test error message"
+
+
+async def test_format_tool_produces_serializable_schema(hass: HomeAssistant):
+    """Test that tool schemas are still serializable after Home Assistant's serializer runs."""
+    assert await async_setup_component(hass, "intent", {})
+
+    handlers = [h for h in intent.async_get(hass) if h.slot_schema]
+    assert handlers
+
+    for handler in handlers:
+        tool = IntentTool(handler.intent_type, handler)
+        formatted = _format_tool(tool, llm.selector_serializer)
+
+        parameters = formatted["function"]["parameters"]
+        assert parameters["type"] == "object"
+        assert parameters["properties"], handler.intent_type
+        json.dumps(formatted)

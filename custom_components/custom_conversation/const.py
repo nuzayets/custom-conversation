@@ -108,7 +108,21 @@ LANGFUSE_SCORE_NAME = "cc_score"
 LANGFUSE_SCORE_POSITIVE = "positive"
 LANGFUSE_SCORE_NEGATIVE = "negative"
 
-# These intents are deprecated, but also in the IGNORE_INTENTS list
+# Home Assistant dropped llm.AssistAPI.IGNORE_INTENTS in 2026.9, so we keep our own copy
+DEFAULT_IGNORED_INTENTS = [
+    "HassClimateGetTemperature",
+    "HassCloseCover",
+    "HassGetCurrentDate",
+    "HassGetCurrentTime",
+    "HassGetState",
+    "HassGetWeather",
+    "HassNevermind",
+    "HassOpenCover",
+    "HassRespond",
+    "HassToggle",
+]
+
+# These intents are deprecated, but also in the DEFAULT_IGNORED_INTENTS list
 HASS_DEPRECATED_INTENTS = [
     "HassOpenCover",
     "HassCloseCover",

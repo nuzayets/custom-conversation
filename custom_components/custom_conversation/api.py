@@ -14,6 +14,7 @@ import voluptuous as vol
 from homeassistant.components.homeassistant import async_should_expose
 from homeassistant.components.intent import async_device_supports_timers
 from homeassistant.components.script import DOMAIN as SCRIPT_DOMAIN
+from homeassistant.components.script.llm import ScriptTool
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_DOMAIN,
@@ -37,7 +38,12 @@ from homeassistant.util.hass_dict import HassKey
 from homeassistant.util.json import JsonObjectType
 from homeassistant.util import yaml as yaml_util
 
-from .const import CONF_IGNORED_INTENTS, CONF_IGNORED_INTENTS_SECTION, LLM_API_ID
+from .const import (
+    CONF_IGNORED_INTENTS,
+    CONF_IGNORED_INTENTS_SECTION,
+    DEFAULT_IGNORED_INTENTS,
+    LLM_API_ID,
+)
 from .prompt_manager import PromptContext, PromptManager
 
 
@@ -142,11 +148,11 @@ class CustomLLMAPI(llm.API):
             )
             ignore_intents = set(
                 ignored_intents_section.get(
-                    CONF_IGNORED_INTENTS, llm.AssistAPI.IGNORE_INTENTS
+                    CONF_IGNORED_INTENTS, DEFAULT_IGNORED_INTENTS
                 )
             )
         else:
-            ignore_intents = llm.AssistAPI.IGNORE_INTENTS
+            ignore_intents = set(DEFAULT_IGNORED_INTENTS)
 
         if not llm_context.device_id or not async_device_supports_timers(
             self.hass, llm_context.device_id
@@ -191,7 +197,7 @@ class CustomLLMAPI(llm.API):
                 ):
                     continue
 
-                tools.append(llm.ScriptTool(self.hass, state.entity_id))
+                tools.append(ScriptTool(self.hass, state.entity_id))
 
             if exposed_entities:
                 tools.append(GetLiveContextTool())

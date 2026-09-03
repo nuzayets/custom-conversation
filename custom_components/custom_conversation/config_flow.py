@@ -70,6 +70,7 @@ from .const import (
     DEFAULT_API_PROMPT_EXPOSED_ENTITIES,
     DEFAULT_API_PROMPT_TIMERS_UNSUPPORTED,
     DEFAULT_BASE_PROMPT,
+    DEFAULT_IGNORED_INTENTS,
     DEFAULT_INSTRUCTIONS_PROMPT,
     DEFAULT_MAX_TOKENS,
     DEFAULT_PROMPT_NO_ENABLED_ENTITIES,
@@ -516,9 +517,7 @@ class CustomConversationOptionsFlow(OptionsFlow):
                 CONF_IGNORED_INTENTS_SECTION, {}
             )
             if CONF_IGNORED_INTENTS not in ignored_intents_section:
-                ignored_intents_section[CONF_IGNORED_INTENTS] = (
-                    llm.AssistAPI.IGNORE_INTENTS
-                )
+                ignored_intents_section[CONF_IGNORED_INTENTS] = DEFAULT_IGNORED_INTENTS
                 processed_input[CONF_IGNORED_INTENTS_SECTION] = ignored_intents_section
 
             # If any of the custom prompts are an empty string, use the defaults
@@ -536,7 +535,7 @@ class CustomConversationOptionsFlow(OptionsFlow):
         hass = self.hass
         hass_apis = self._get_hass_apis(hass)
         intents = await self._get_intents(hass)
-        default_ignored = llm.AssistAPI.IGNORE_INTENTS
+        default_ignored = DEFAULT_IGNORED_INTENTS
 
         # Define the schema for options, using existing options as defaults
         schema = vol.Schema(
@@ -770,12 +769,11 @@ class CustomConversationOptionsFlow(OptionsFlow):
 
     async def _get_intents(self, hass: HomeAssistant) -> list[SelectOptionDict]:
         """Get available intents."""
-        hass_recommended_ignored = llm.AssistAPI.IGNORE_INTENTS
         return [
             {
                 "value": intent_obj.intent_type,
-                "label": f"{intent_obj.intent_type} (Hass Recommended)"
-                if intent_obj.intent_type in hass_recommended_ignored
+                "label": f"{intent_obj.intent_type} (Ignored by default)"
+                if intent_obj.intent_type in DEFAULT_IGNORED_INTENTS
                 else intent_obj.intent_type,
             }
             for intent_obj in intent.async_get(hass)
