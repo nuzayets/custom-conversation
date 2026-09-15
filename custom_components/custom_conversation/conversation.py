@@ -467,6 +467,7 @@ class CustomConversationEntity(
                     return conversation.ConversationResult(
                         response=result.response,
                         conversation_id=session.conversation_id,
+                        continue_conversation=result.continue_conversation,
                     )
                 # If we're about to call the LLM Agent next, we want to delete the last two messages
                 if options.get(CONF_AGENTS_SECTION, {}).get(CONF_ENABLE_LLM_AGENT):
