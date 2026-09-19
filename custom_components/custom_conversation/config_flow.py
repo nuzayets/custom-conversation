@@ -122,6 +122,7 @@ class CustomConversationConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Custom Conversation."""
 
     VERSION = CONFIG_VERSION
+    MINOR_VERSION = 2
     _flow_data: dict[str, Any] = {}
 
     async def _validate_credentials_and_get_models(

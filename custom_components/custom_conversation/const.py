@@ -30,18 +30,6 @@ CONF_AGENTS_SECTION = "agents"
 CONF_LLM_PARAMETERS_SECTION = "llm_parameters"
 CONF_IGNORED_INTENTS_SECTION = "ignored_intents_section"
 CONF_IGNORED_INTENTS = "ignored_intents"
-DEFAULT_IGNORED_INTENTS = {
-    "HassCloseCover",
-    "HassGetCurrentDate",
-    "HassGetCurrentTime",
-    "HassGetState",
-    "HassGetTemperature",
-    "HassGetWeather",
-    "HassNevermind",
-    "HassOpenCover",
-    "HassRespond",
-    "HassToggle",
-}
 
 CONF_MAX_TOKENS = "max_tokens"
 DEFAULT_MAX_TOKENS = 150
@@ -78,7 +66,7 @@ DEFAULT_PROMPT_NO_ENABLED_ENTITIES = (
 CONF_API_PROMPT_BASE = "prompt_api_base"
 DEFAULT_API_PROMPT_BASE = (
     "When controlling Home Assistant always call the intent tools. "
-    "Use HassTurnOn to lock and HassTurnOff to unlock a lock. "
+    "Use intent__HassTurnOn to lock and intent__HassTurnOff to unlock a lock. "
     "When controlling a device, prefer passing just name and domain. "
     "When controlling an area, prefer passing just area name and domain."
 )
@@ -105,7 +93,7 @@ DEFAULT_API_PROMPT_EXPOSED_ENTITIES = (
 
 CONF_PROMPT_LIVE_CONTEXT = "prompt_live_context"
 DEFAULT_API_PROMPT_LIVE_CONTEXT = (
-    "Use GetLiveContext for questions about the current state, value, or mode "
+    "Use homeassistant__GetLiveContext for questions about the current state, value, or mode "
     "of devices and sensors. You MUST call it when the answer requires live data."
 )
 

@@ -5,19 +5,20 @@ name = "pypi"
 
 [packages]
 gazetteer-matcher = "==1.1.0"
-hassil = "==3.12.0"
+hassil = "==3.12.1"
 home-assistant-intents = "==2026.8.28"
 mutagen = "*"
 ha-ffmpeg = "*"
 langfuse = "==4.0.0"
 litellm = "==1.81.4"
-homeassistant = "==2026.9.0"
+homeassistant = "==2026.9.3"
 openai = ">=2.8.0"
+pydantic = "==2.13.4"
 tqdm = "==4.67.1"
 
 [dev-packages]
 pytest = "*"
-pytest-homeassistant-custom-component = "==0.13.363"
+pytest-homeassistant-custom-component = "==0.13.366"
 pytest-cov = "*"
 pytest-asyncio = "*"
 python-dotenv = "*"

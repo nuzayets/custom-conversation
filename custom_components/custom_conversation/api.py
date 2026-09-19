@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from langfuse.model import Prompt
-import slugify as unicode_slug
 
 from homeassistant.components import llm as llm_component
 from homeassistant.components.homeassistant.llm import (
@@ -138,10 +137,6 @@ class CustomLLMAPI(llm.API):
         else:
             ignore_intents = DEFAULT_IGNORED_INTENTS
 
-        ignored_tool_names = {
-            unicode_slug.slugify(name, separator="_", lowercase=False)
-            for name in ignore_intents
-        }
         assist_tools = await llm_component.async_get_tools(
             self.hass, llm_context, llm.LLM_API_ASSIST
         )
@@ -150,10 +145,10 @@ class CustomLLMAPI(llm.API):
         ignore_time = "HassGetCurrentTime" in ignore_intents
         for tool in assist_tools.tools:
             if isinstance(tool, llm.IntentTool):
-                if tool.name in ignored_tool_names:
+                if tool.intent_type in ignore_intents:
                     continue
                 tool = CardPreservingIntentTool(tool)
-            elif tool.name == "GetDateTime":
+            elif tool.name == "llm__GetDateTime":
                 if ignore_date and ignore_time:
                     continue
                 if ignore_date or ignore_time:

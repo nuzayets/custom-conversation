@@ -11,17 +11,22 @@ from homeassistant.helpers.typing import ConfigType
 
 from .api import CustomLLMAPI
 from .const import (
+    CONF_API_PROMPT_BASE,
     CONF_BASE_URL,
     CONF_CHAT_MODEL,
+    CONF_CUSTOM_PROMPTS_SECTION,
     CONF_LLM_PARAMETERS_SECTION,
     CONF_MAX_TOKENS,
     CONF_PRIMARY_API_KEY,
     CONF_PRIMARY_BASE_URL,
     CONF_PRIMARY_CHAT_MODEL,
     CONF_PRIMARY_PROVIDER,
+    CONF_PROMPT_LIVE_CONTEXT,
     CONF_TEMPERATURE,
     CONF_TOP_P,
     CONFIG_VERSION,
+    DEFAULT_API_PROMPT_BASE,
+    DEFAULT_API_PROMPT_LIVE_CONTEXT,
     DEFAULT_PROVIDER,
     DOMAIN,
     LLM_API_ID,
@@ -146,5 +151,24 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
             version=CONFIG_VERSION,
         )
         LOGGER.info("Successfully migrated configuration to version %s", CONFIG_VERSION)
+
+    if config_entry.minor_version < 2:
+        options = dict(config_entry.options)
+        if CONF_CUSTOM_PROMPTS_SECTION in options:
+            prompts = dict(options[CONF_CUSTOM_PROMPTS_SECTION])
+            for key, current, prefix in (
+                (CONF_API_PROMPT_BASE, DEFAULT_API_PROMPT_BASE, "intent__"),
+                (
+                    CONF_PROMPT_LIVE_CONTEXT,
+                    DEFAULT_API_PROMPT_LIVE_CONTEXT,
+                    "homeassistant__",
+                ),
+            ):
+                if prompts.get(key) == current.replace(prefix, ""):
+                    prompts[key] = current
+            options[CONF_CUSTOM_PROMPTS_SECTION] = prompts
+        hass.config_entries.async_update_entry(
+            config_entry, options=options, minor_version=2
+        )
 
     return True

@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from litellm import RateLimitError
 import pytest
-import voluptuous as vol
 
 from custom_components.custom_conversation import CustomConversationConfigEntry
 from custom_components.custom_conversation.const import (
@@ -14,7 +13,6 @@ from custom_components.custom_conversation.const import (
     CONVERSATION_ERROR_EVENT,
     LLM_API_ID,
 )
-from custom_components.custom_conversation.api import IntentTool
 from custom_components.custom_conversation.conversation import (
     CustomConversationEntity,
     _format_tool,
@@ -52,13 +50,16 @@ async def test_custom_conversation_entity_initialization(hass: HomeAssistant, co
         == conversation.ConversationEntityFeature.CONTROL
     )
 
-async def test_custom_conversation_tries_hass_agent_first(hass: HomeAssistant, config_entry: CustomConversationConfigEntry):
+@pytest.mark.parametrize("continue_conversation", [False, True])
+async def test_custom_conversation_tries_hass_agent_first(hass: HomeAssistant, config_entry: CustomConversationConfigEntry, continue_conversation):
     """Test that CustomConversationEntity tries the Home Assistant agent first when both are enabled."""
     assert await async_setup_component(hass, "custom_conversation", {})
     await hass.async_block_till_done()
     mock_response = intent.IntentResponse(language="en", intent=Mock())
     mock_response.error_code = None
-    mock_result = conversation.ConversationResult(mock_response, "test-conversation-id")
+    mock_result = conversation.ConversationResult(
+        mock_response, "test-conversation-id", continue_conversation=continue_conversation
+    )
     with patch(
         "custom_components.custom_conversation.conversation.CustomConversationEntity._async_handle_message_with_hass", new_callable=AsyncMock, return_value=mock_result
     ) as mock_process_hass:
@@ -79,6 +80,7 @@ async def test_custom_conversation_tries_hass_agent_first(hass: HomeAssistant, c
         result = await conversation.async_converse(hass, "hello", "test-conversation-id", Context(), agent_id=config_entry.entry_id)
     assert result.conversation_id == "test-conversation-id"
     assert mock_process_hass.called
+    assert result.continue_conversation is continue_conversation
 
 async def test_custom_conversation_rate_limit_error(hass: HomeAssistant, config_entry: CustomConversationConfigEntry):
     """Test that rate limit errors are properly handled and event is fired."""
@@ -253,7 +255,7 @@ async def test_format_tool_produces_serializable_schema(hass: HomeAssistant):
     assert handlers
 
     for handler in handlers:
-        tool = IntentTool(handler.intent_type, handler)
+        tool = llm.IntentTool(handler.intent_type, handler)
         formatted = _format_tool(tool, llm.selector_serializer)
 
         parameters = formatted["function"]["parameters"]

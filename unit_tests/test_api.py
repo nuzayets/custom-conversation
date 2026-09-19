@@ -207,15 +207,21 @@ async def test_custom_llm_api_get_tools(
     )
     await hass.async_block_till_done()
 
-    handler = MagicMock(spec=intent.IntentHandler, description=None, slot_schema=None)
     non_intent_tool = MagicMock(spec=llm.Tool)
-    non_intent_tool.name = "GetDateTime"
+    non_intent_tool.name = "llm__GetDateTime"
     tools_from_platforms = [
-        llm.IntentTool("HassTurnOn", handler),
-        llm.IntentTool("HassTurnOff", handler),
-        llm.IntentTool("My_Intent", handler),
-        non_intent_tool,
+        llm.IntentTool(
+            f"intent__{intent_type}",
+            MagicMock(
+                spec=intent.IntentHandler,
+                intent_type=intent_type,
+                description=None,
+                slot_schema=None,
+            ),
+        )
+        for intent_type in ("HassTurnOn", "HassTurnOff", "My Intent")
     ]
+    tools_from_platforms.append(non_intent_tool)
 
     with patch(
         "custom_components.custom_conversation.api.llm_component.async_get_tools",
@@ -227,7 +233,9 @@ async def test_custom_llm_api_get_tools(
     mock_get_tools.assert_awaited_once_with(
         hass, mock_llm_context, llm.LLM_API_ASSIST
     )
-    assert [tool.name for tool in tools.tools] == ["HassTurnOn", "GetDateTime"]
+    assert [tool.name for tool in tools.tools] == [
+        "intent__HassTurnOn", "llm__GetDateTime"
+    ]
     assert isinstance(tools.tools[0], CardPreservingIntentTool)
 
 
@@ -252,7 +260,7 @@ async def test_filtered_date_time_tool(
         },
     )
     combined_tool = MagicMock(spec=llm.Tool)
-    combined_tool.name = "GetDateTime"
+    combined_tool.name = "llm__GetDateTime"
     combined_tool.description = "Provides the current date and time."
     combined_tool.parameters = vol.Schema({})
     combined_tool.async_call = AsyncMock(
@@ -311,7 +319,7 @@ async def test_card_preserving_intent_tool(hass, mock_llm_context):
 async def test_custom_llm_api_discovers_exposed_script(
     custom_llm_api, hass, mock_llm_context
 ):
-    """Test exposed scripts are discovered through the HA 2026.8 platform API."""
+    """Test exposed scripts are discovered through the HA 2026.9 platform API."""
     assert await async_setup_component(
         hass,
         "script",
@@ -327,8 +335,8 @@ async def test_custom_llm_api_discovers_exposed_script(
 
     tools = llm_tools.tools
     tool_names = {tool.name for tool in tools}
-    assert {"GetLiveContext", "test_script"} <= tool_names
-    assert "GetDateTime" not in tool_names
+    assert {"homeassistant__GetLiveContext", "script__test_script"} <= tool_names
+    assert "llm__GetDateTime" not in tool_names
     script_tool = next(tool for tool in tools if isinstance(tool, ScriptTool))
     result = await script_tool.async_call(
         hass,

@@ -120,7 +120,7 @@ async def test_get_api_prompt_with_location(prompt_manager, hass, config_entry):
 
     assert "Custom API base prompt" in prompt
     assert "Custom location prompt for Living Room" in prompt
-    assert "Use GetLiveContext" in prompt
+    assert "Use homeassistant__GetLiveContext" in prompt
     assert "Test Light" in prompt
 
 
