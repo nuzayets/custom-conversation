@@ -21,6 +21,7 @@ from custom_components.custom_conversation.prompt_manager import (
     PromptManager,
 )
 from homeassistant.components import llm as llm_component
+from homeassistant.components.llm.llm import GetDateTimeTool
 from homeassistant.components.script.llm import ScriptTool
 from homeassistant.core import Context
 from homeassistant.helpers import device_registry as dr, intent, llm
@@ -259,21 +260,7 @@ async def test_filtered_date_time_tool(
             }
         },
     )
-    combined_tool = MagicMock(spec=llm.Tool)
-    combined_tool.name = "llm__GetDateTime"
-    combined_tool.description = "Provides the current date and time."
-    combined_tool.parameters = vol.Schema({})
-    combined_tool.async_call = AsyncMock(
-        return_value={
-            "success": True,
-            "result": {
-                "date": "2026-08-12",
-                "weekday": "Wednesday",
-                "time": "12:34:56",
-                "timezone": "UTC",
-            },
-        }
-    )
+    combined_tool = GetDateTimeTool()
     with patch(
         "custom_components.custom_conversation.api.llm_component.async_get_tools",
         new_callable=AsyncMock,
@@ -288,7 +275,11 @@ async def test_filtered_date_time_tool(
         llm.ToolInput(tool_name=tool.name, tool_args={}),
         mock_llm_context,
     )
-    assert set(result["result"]) == expected_fields
+    assert set(result.data) == expected_fields
+    assert result.error is False
+    assert tool.title == combined_tool.title
+    assert tool.annotations == combined_tool.annotations
+    assert tool.integration == combined_tool.integration
 
 
 @pytest.mark.asyncio
@@ -296,11 +287,14 @@ async def test_card_preserving_intent_tool(hass, mock_llm_context):
     """Test cards removed by HA's serializer remain available to event consumers."""
     response = intent.IntentResponse(language="en")
     response.async_set_card("Title", "Content")
-    serialized = llm.IntentResponseDict(response)
+    serialized = llm.ToolResult(data=llm.IntentResponseDict(response))
     delegated_tool = MagicMock(spec=llm.IntentTool)
     delegated_tool.name = "CardIntent"
+    delegated_tool.title = "Card intent"
     delegated_tool.description = "Return a card"
     delegated_tool.parameters = vol.Schema({})
+    delegated_tool.integration = "intent"
+    delegated_tool.annotations = llm.ToolAnnotations(read_only=True)
     delegated_tool.async_call = AsyncMock(return_value=serialized)
     tool = CardPreservingIntentTool(delegated_tool)
 
@@ -310,9 +304,37 @@ async def test_card_preserving_intent_tool(hass, mock_llm_context):
         mock_llm_context,
     )
 
-    assert result["card"] == {
+    assert result.data["card"] == {
         "simple": {"title": "Title", "content": "Content"}
     }
+    assert result is serialized
+    assert tool.title == delegated_tool.title
+    assert tool.annotations == delegated_tool.annotations
+    assert tool.integration == delegated_tool.integration
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", [CardPreservingIntentTool, FilteredDateTimeTool])
+async def test_wrapped_tool_preserves_error_result(hass, mock_llm_context, wrapper):
+    """Return tool errors without changing their data or error flag."""
+    result = llm.ToolResult(data={"error": "failed", "time": "unavailable"}, error=True)
+    delegated_tool = MagicMock(spec=llm.IntentTool)
+    delegated_tool.name = "test"
+    delegated_tool.description = "Test tool"
+    delegated_tool.parameters = vol.Schema({})
+    delegated_tool.async_call = AsyncMock(return_value=result)
+    if wrapper is FilteredDateTimeTool:
+        tool = wrapper(delegated_tool, ignore_date=False, ignore_time=True)
+    else:
+        tool = wrapper(delegated_tool)
+
+    returned = await tool.async_call(
+        hass, llm.ToolInput(tool_name=tool.name, tool_args={}), mock_llm_context
+    )
+
+    assert returned is result
+    assert returned.error is True
+    assert returned.data == {"error": "failed", "time": "unavailable"}
 
 
 @pytest.mark.asyncio
@@ -343,4 +365,5 @@ async def test_custom_llm_api_discovers_exposed_script(
         llm.ToolInput(tool_name=script_tool.name, tool_args={}),
         mock_llm_context,
     )
-    assert result["success"] is True
+    assert result.error is False
+    assert result.data == {"result": {}}

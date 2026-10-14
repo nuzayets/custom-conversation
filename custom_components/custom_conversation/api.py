@@ -166,19 +166,22 @@ class CardPreservingIntentTool(llm.Tool):
         self.name = tool.name
         self.description = tool.description
         self.parameters = tool.parameters
+        self.title = tool.title
+        self.annotations = tool.annotations
+        self.integration = tool.integration
 
     async def async_call(
         self,
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> dict:
+    ) -> llm.ToolResult:
         """Call the intent and restore its card for downstream consumers."""
         result = await self._tool.async_call(hass, tool_input, llm_context)
-        if isinstance(result, llm.IntentResponseDict):
-            card = result.original.as_dict().get("card")
+        if isinstance(result.data, llm.IntentResponseDict):
+            card = result.data.original.as_dict().get("card")
             if card:
-                result["card"] = card
+                result.data["card"] = card
         return result
 
 
@@ -199,21 +202,23 @@ class FilteredDateTimeTool(llm.Tool):
             else "Provides the current date."
         )
         self.parameters = tool.parameters
+        self.title = tool.title
+        self.annotations = tool.annotations
+        self.integration = tool.integration
 
     async def async_call(
         self,
         hass: HomeAssistant,
         tool_input: llm.ToolInput,
         llm_context: llm.LLMContext,
-    ) -> dict:
+    ) -> llm.ToolResult:
         """Call the combined tool and remove ignored fields."""
         result = await self._tool.async_call(hass, tool_input, llm_context)
-        values = result.get("result")
-        if isinstance(values, dict):
+        if not result.error:
             if self._ignore_date:
-                values.pop("date", None)
-                values.pop("weekday", None)
+                result.data.pop("date", None)
+                result.data.pop("weekday", None)
             if self._ignore_time:
-                values.pop("time", None)
-                values.pop("timezone", None)
+                result.data.pop("time", None)
+                result.data.pop("timezone", None)
         return result

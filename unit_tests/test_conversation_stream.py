@@ -38,7 +38,7 @@ from homeassistant.components import conversation
 from homeassistant.const import CONF_LLM_HASS_API
 from homeassistant.core import Context
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import intent
+from homeassistant.helpers import intent, llm
 from homeassistant.setup import async_setup_component
 
 
@@ -493,13 +493,15 @@ def test_tool_results_serialize_home_assistant_values():
         agent_id="agent-id",
         tool_call_id="tool-call-id",
         tool_name="test-tool",
-        tool_result={
-            "time": time(8, 30),
-            "decimal": Decimal("1.25"),
-            "enum": ResultKind.READY,
-            "set": {"one", "two"},
-            "nested": [{"time": time(9, 45)}],
-        },
+        result=llm.ToolResult(
+            data={
+                "time": time(8, 30),
+                "decimal": Decimal("1.25"),
+                "enum": ResultKind.READY,
+                "set": {"one", "two"},
+                "nested": [{"time": time(9, 45)}],
+            }
+        ),
     )
 
     message = _convert_content_to_param(content)

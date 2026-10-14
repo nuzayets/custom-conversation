@@ -196,7 +196,7 @@ def _convert_content_to_param(
         return ChatCompletionToolMessageParam(
             role="tool",
             tool_call_id=content.tool_call_id,
-            content=json.dumps(content.tool_result, cls=ExtendedJSONEncoder),
+            content=json.dumps(content.result.data, cls=ExtendedJSONEncoder),
         )
     if content.role != "assistant" or not content.tool_calls:
         role = content.role
